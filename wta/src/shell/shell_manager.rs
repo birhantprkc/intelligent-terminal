@@ -555,4 +555,27 @@ impl ShellManager {
             .request("get_active_pane", serde_json::json!({}))
             .await
     }
+
+    /// Show a quick-pick dialog in WT and return the user's selection.
+    pub async fn wt_quick_pick(
+        &self,
+        title: &str,
+        choices: &[String],
+        allow_free_input: bool,
+    ) -> anyhow::Result<serde_json::Value> {
+        let choices_json: Vec<serde_json::Value> = choices
+            .iter()
+            .map(|c| serde_json::Value::String(c.clone()))
+            .collect();
+        self.wt()?
+            .request(
+                "quick_pick",
+                serde_json::json!({
+                    "title": title,
+                    "choices": choices_json,
+                    "allow_free_input": allow_free_input,
+                }),
+            )
+            .await
+    }
 }

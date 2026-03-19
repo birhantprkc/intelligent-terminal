@@ -201,6 +201,21 @@ enum Command {
         #[arg(short = 's', long, default_value = "bash")]
         shell: String,
     },
+
+    /// Show a quick-pick dialog in Windows Terminal and print the user's selection
+    QuickPick {
+        /// Title/question shown above the choices
+        #[arg(value_name = "TITLE")]
+        title: String,
+
+        /// Choices to present (1 or more)
+        #[arg(required = true)]
+        choices: Vec<String>,
+
+        /// Allow freeform text input in addition to choices
+        #[arg(long)]
+        free_input: bool,
+    },
 }
 
 // ─── Entry Point ────────────────────────────────────────────────────────────
@@ -427,6 +442,35 @@ async fn main() -> Result<()> {
         // ── Set environment variables ──
         Some(Command::SetEnv { shell }) => {
             run_set_env(&pipe_override, &shell)
+        }
+
+        // ── Quick pick ──
+        Some(Command::QuickPick {
+            title,
+            choices,
+            free_input,
+        }) => {
+            let channel = connect_channel(&pipe_override).await?;
+            let choices_json: Vec<serde_json::Value> =
+                choices.iter().map(|c| serde_json::Value::String(c.clone())).collect();
+            let result = channel
+                .request(
+                    "quick_pick",
+                    json!({
+                        "title": title,
+                        "choices": choices_json,
+                        "allow_free_input": free_input,
+                    }),
+                )
+                .await?;
+            let cancelled = result.get("cancelled").and_then(|v| v.as_bool()).unwrap_or(false);
+            if cancelled {
+                std::process::exit(1);
+            }
+            if let Some(selected) = result.get("selected").and_then(|v| v.as_str()) {
+                println!("{}", selected);
+            }
+            Ok(())
         }
 
         // ── No subcommand = ACP TUI mode (default) ──

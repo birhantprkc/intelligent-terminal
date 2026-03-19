@@ -32,6 +32,7 @@ const std::vector<std::string> ProtocolRequestHandler::_supportedMethods = {
     "send_input",
     "set_session_variable",
     "set_settings",
+    "quick_pick",
 };
 
 ProtocolRequestHandler::ProtocolRequestHandler(WindowEmperor& emperor) :
@@ -149,6 +150,8 @@ Json::Value ProtocolRequestHandler::HandleRequest(const Json::Value& request, bo
             result = _handleSetSessionVariable(params);
         else if (method == "set_settings")
             result = _handleSetSettings(params);
+        else if (method == "quick_pick")
+            result = _handleQuickPick(params);
         else
             return _makeErrorResponse(id, "invalid_method", "Unknown method: " + method);
 
@@ -865,6 +868,57 @@ Json::Value ProtocolRequestHandler::_handleSetSettings(const Json::Value& params
     return result;
 }
 
+Json::Value ProtocolRequestHandler::_handleQuickPick(const Json::Value& params)
+{
+    const auto title = params.get("title", "").asString();
+    const auto& choices = params.get("choices", Json::arrayValue);
+    const auto allowFreeInput = params.get("allow_free_input", false).asBool();
+
+    if (!choices.isArray() || choices.empty())
+    {
+        throw std::runtime_error("choices array is required and must not be empty.");
+    }
+
+    // Serialize choices back to JSON string for the WinRT boundary.
+    Json::StreamWriterBuilder writerBuilder;
+    writerBuilder["indentation"] = "";
+    const auto choicesJsonStr = Json::writeString(writerBuilder, choices);
+
+    // Show the quick pick dialog in the most recently focused window.
+    const auto host = _emperor._mostRecentWindow();
+    if (!host)
+    {
+        throw std::runtime_error("No windows available.");
+    }
+
+    const auto page = _getPage(host);
+    if (!page)
+    {
+        throw std::runtime_error("Terminal page not available.");
+    }
+
+    const auto resultJson = winrt::to_string(page.ShowProtocolQuickPick(
+        winrt::to_hstring(title),
+        winrt::to_hstring(choicesJsonStr),
+        allowFreeInput));
+
+    if (resultJson.empty())
+    {
+        throw std::runtime_error("Quick pick dialog failed.");
+    }
+
+    Json::Value result;
+    Json::CharReaderBuilder readerBuilder;
+    std::string parseErrors;
+    std::istringstream stream(resultJson);
+    if (!Json::parseFromStream(readerBuilder, stream, &result, &parseErrors))
+    {
+        throw std::runtime_error("Failed to parse quick pick result.");
+    }
+
+    return result;
+}
+
 // ============================================================================
 // Thread Marshaling Helpers
 // ============================================================================
@@ -894,6 +948,12 @@ ProtocolRequestHandler::RiskLevel ProtocolRequestHandler::_getRiskLevel(const st
         method == "get_process_status" ||
         method == "get_session_variable" ||
         method == "get_settings")
+    {
+        return RiskLevel::Read;
+    }
+
+    // Quick pick is a UI prompt, not a mutation — auto-approve
+    if (method == "quick_pick")
     {
         return RiskLevel::Read;
     }

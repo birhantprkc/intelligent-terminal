@@ -48,6 +48,7 @@ private:
     Json::Value _handleSendInput(const Json::Value& params);
     Json::Value _handleSetSessionVariable(const Json::Value& params);
     Json::Value _handleSetSettings(const Json::Value& params);
+    Json::Value _handleQuickPick(const Json::Value& params);
 
     // Helper to build error responses
     static Json::Value _makeError(const std::string& code, const std::string& message);

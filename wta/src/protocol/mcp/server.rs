@@ -118,6 +118,17 @@ pub struct SplitPaneParams {
     pub size: Option<f64>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct QuickPickParams {
+    /// Title/question shown to the user
+    pub title: String,
+    /// Choices to present
+    pub choices: Vec<String>,
+    /// Whether to allow freeform text input in addition to choices
+    #[serde(default)]
+    pub allow_free_input: bool,
+}
+
 impl WtaMcpServer {
     pub fn new(shell_mgr: Arc<ShellManager>) -> Self {
         Self {
@@ -405,6 +416,23 @@ impl WtaMcpServer {
             Err(e) => format!("Error: {}", e),
         };
         mcp_log(&format!("<<< wt_close_pane: {}", Self::truncate(&result, 200)));
+        result
+    }
+
+    /// Show a quick-pick dialog in Windows Terminal and return the user's selection.
+    /// Use this to ask the user questions with predefined choices (and optional freeform input).
+    #[tool(description = "Show a quick-pick dialog to the user with choices. Returns the selected text. Use for confirmations, next-step suggestions, or any user decision.")]
+    async fn wt_quick_pick(&self, Parameters(params): Parameters<QuickPickParams>) -> String {
+        mcp_log(&format!(">>> wt_quick_pick(title={:?}, choices={:?}, free_input={})", params.title, params.choices, params.allow_free_input));
+        let result = match self
+            .shell_mgr
+            .wt_quick_pick(&params.title, &params.choices, params.allow_free_input)
+            .await
+        {
+            Ok(val) => Self::json_pretty(&val),
+            Err(e) => format!("Error: {}", e),
+        };
+        mcp_log(&format!("<<< wt_quick_pick: {}", Self::truncate(&result, 200)));
         result
     }
 }

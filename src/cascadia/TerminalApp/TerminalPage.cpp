@@ -845,11 +845,11 @@ namespace winrt::TerminalApp::implementation
             return;
         }
 
-        // 3. Get CWD. VirtualWorkingDirectory is checked first because
-        //    ProcessStartupActions temporarily sets it to the launching shell's
-        //    CWD for CLI-remoted commands (e.g. `wt agent`), matching how
-        //    `split-pane -d $PWD` works. For the in-terminal path (command
-        //    palette), VirtualWorkingDirectory is the window's default CWD.
+        // 3. Get CWD from the active pane. Priority:
+        //    a) VirtualWorkingDirectory (set by CLI-remoted commands like `wt agent`)
+        //    b) Active pane's current working directory (from shell integration / OSC 9;9)
+        //    c) Profile's configured starting directory
+        //    d) User's home directory (avoids defaulting to System32)
         winrt::hstring startingDirectory = _WindowProperties.VirtualWorkingDirectory();
         if (startingDirectory.empty())
         {
@@ -866,6 +866,15 @@ namespace winrt::TerminalApp::implementation
                 {
                     startingDirectory = profile.EvaluatedStartingDirectory();
                 }
+            }
+        }
+        if (startingDirectory.empty())
+        {
+            // Fall back to user's home directory instead of System32.
+            wchar_t homePath[MAX_PATH];
+            if (GetEnvironmentVariableW(L"USERPROFILE", homePath, MAX_PATH) > 0)
+            {
+                startingDirectory = winrt::hstring{ homePath };
             }
         }
 

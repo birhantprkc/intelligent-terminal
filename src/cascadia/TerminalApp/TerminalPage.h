@@ -192,6 +192,7 @@ namespace winrt::TerminalApp::implementation
         hstring SplitProtocolPane(hstring paneId, Microsoft::Terminal::Settings::Model::SplitDirection direction, float size, Microsoft::Terminal::Settings::Model::NewTerminalArgs args, bool background);
         bool CloseProtocolPane(hstring paneId);
         bool SendProtocolInput(hstring paneId, hstring text);
+        hstring ShowProtocolQuickPick(hstring title, hstring choicesJson, bool allowFreeInput);
         void InitializeCoordinator(Microsoft::Terminal::Settings::Model::NewTerminalArgs args);
         void ToggleCoordinator();
         bool CoordinatorVisible();

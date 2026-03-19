@@ -839,4 +839,111 @@ namespace winrt::TerminalApp::implementation
             return false;
         });
     }
+
+    hstring TerminalPage::ShowProtocolQuickPick(hstring title, hstring choicesJson, bool allowFreeInput)
+    {
+        return _runOnUIThread(*this, [&]() -> hstring {
+            // Parse the choices JSON array: ["Choice 1", "Choice 2", ...]
+            Json::Value choices;
+            {
+                Json::CharReaderBuilder rb;
+                std::string errors;
+                auto choicesStr = winrt::to_string(choicesJson);
+                std::istringstream stream(choicesStr);
+                if (!Json::parseFromStream(rb, stream, &choices, &errors) || !choices.isArray())
+                {
+                    return L"";
+                }
+            }
+
+            // Build a StackPanel with RadioButtons for each choice,
+            // plus an optional TextBox for freeform input.
+            auto panel = winrt::Windows::UI::Xaml::Controls::StackPanel();
+            panel.Spacing(8);
+
+            std::vector<winrt::Windows::UI::Xaml::Controls::RadioButton> radioButtons;
+            for (Json::ArrayIndex i = 0; i < choices.size(); ++i)
+            {
+                auto rb = winrt::Windows::UI::Xaml::Controls::RadioButton();
+                rb.Content(winrt::box_value(winrt::to_hstring(choices[i].asString())));
+                rb.GroupName(L"QuickPick");
+                if (i == 0)
+                {
+                    rb.IsChecked(true);
+                }
+                panel.Children().Append(rb);
+                radioButtons.push_back(rb);
+            }
+
+            winrt::Windows::UI::Xaml::Controls::TextBox freeInputBox{ nullptr };
+            winrt::Windows::UI::Xaml::Controls::RadioButton freeInputRadio{ nullptr };
+            if (allowFreeInput)
+            {
+                freeInputRadio = winrt::Windows::UI::Xaml::Controls::RadioButton();
+                freeInputRadio.Content(winrt::box_value(winrt::hstring{ L"Other (type below):" }));
+                freeInputRadio.GroupName(L"QuickPick");
+                panel.Children().Append(freeInputRadio);
+
+                freeInputBox = winrt::Windows::UI::Xaml::Controls::TextBox();
+                freeInputBox.PlaceholderText(L"Type your response...");
+                freeInputBox.Margin({ 24, 0, 0, 0 });
+                // Auto-select the freeform radio when user starts typing
+                freeInputBox.GotFocus([freeInputRadio](auto&&, auto&&) {
+                    freeInputRadio.IsChecked(true);
+                });
+                panel.Children().Append(freeInputBox);
+            }
+
+            // Create and show the ContentDialog
+            winrt::Windows::UI::Xaml::Controls::ContentDialog dialog;
+            dialog.Title(winrt::box_value(title));
+            dialog.Content(panel);
+            dialog.PrimaryButtonText(L"OK");
+            dialog.CloseButtonText(L"Cancel");
+            dialog.DefaultButton(winrt::Windows::UI::Xaml::Controls::ContentDialogButton::Primary);
+
+            // XamlRoot is required for ContentDialog in Islands
+            if (const auto root = this->XamlRoot())
+            {
+                dialog.XamlRoot(root);
+            }
+
+            const auto dialogResult = dialog.ShowAsync().get();
+            if (dialogResult != winrt::Windows::UI::Xaml::Controls::ContentDialogResult::Primary)
+            {
+                // User cancelled
+                Json::Value result;
+                result["cancelled"] = true;
+                result["selected"] = "";
+                Json::StreamWriterBuilder wb;
+                wb["indentation"] = "";
+                return winrt::to_hstring(Json::writeString(wb, result));
+            }
+
+            // Find which radio button is selected
+            std::string selectedText;
+            if (freeInputRadio && freeInputRadio.IsChecked().Value())
+            {
+                selectedText = freeInputBox ? winrt::to_string(freeInputBox.Text()) : "";
+            }
+            else
+            {
+                for (size_t i = 0; i < radioButtons.size(); ++i)
+                {
+                    if (radioButtons[i].IsChecked().Value())
+                    {
+                        selectedText = choices[static_cast<Json::ArrayIndex>(i)].asString();
+                        break;
+                    }
+                }
+            }
+
+            Json::Value result;
+            result["cancelled"] = false;
+            result["selected"] = selectedText;
+            Json::StreamWriterBuilder wb;
+            wb["indentation"] = "";
+            return winrt::to_hstring(Json::writeString(wb, result));
+        });
+    }
 }
