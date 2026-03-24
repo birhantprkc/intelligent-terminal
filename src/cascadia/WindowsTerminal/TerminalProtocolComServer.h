@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "ITerminalProtocolServer_h.h"
+#include "ITerminalProtocolServer.h" // MIDL-generated from src/host/proxy/ITerminalProtocolServer.idl
 
 // Per-brand CLSIDs — same pattern as CTerminalHandoff.
 #if defined(WT_BRANDING_RELEASE)
