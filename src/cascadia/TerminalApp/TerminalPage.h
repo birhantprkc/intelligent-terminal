@@ -193,11 +193,13 @@ namespace winrt::TerminalApp::implementation
         bool CloseProtocolPane(hstring paneId);
         bool SendProtocolInput(hstring paneId, hstring text);
         hstring ShowProtocolQuickPick(hstring title, hstring choicesJson, bool allowFreeInput);
+        void InitializeCoordinator(Microsoft::Terminal::Settings::Model::NewTerminalArgs args);
         void ToggleCoordinator();
 
         til::property_changed_event PropertyChanged;
 
         // -------------------------------- WinRT Events ---------------------------------
+        til::typed_event<IInspectable, winrt::hstring> ProtocolVtSequenceReceived;
         til::typed_event<IInspectable, IInspectable> TitleChanged;
         til::typed_event<IInspectable, IInspectable> CloseWindowRequested;
         til::typed_event<IInspectable, winrt::Windows::UI::Xaml::UIElement> SetTitleBarContent;
@@ -272,6 +274,10 @@ namespace winrt::TerminalApp::implementation
             hstring result;
         };
         std::shared_ptr<QuickPickState> _quickPickState;
+
+        // Coordinator sidecar state
+        winrt::Microsoft::Terminal::Control::TermControl _coordinatorControl{ nullptr };
+        bool _coordinatorInitialized{ false };
 
         bool _showTabsFullscreen{ false };
 

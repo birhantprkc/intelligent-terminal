@@ -15,9 +15,8 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::app::{AppEvent, PermOption, PlanEntry, PlanEntryStatus};
 use crate::coordinator::default_supported_delegate_agents;
 use crate::shared_host::PaneContext;
-use crate::shell::{ActivePaneSnapshot, ShellManager, TerminalConfig};
+use crate::shell::{ShellManager, TerminalConfig};
 
-const ACTIVE_PANE_CONTEXT_MAX_LINES: u32 = 80;
 const ACTIVE_PANE_CONTEXT_MAX_CHARS: usize = 4000;
 
 #[derive(Debug, Clone)]
@@ -683,49 +682,6 @@ fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn format_active_pane_context(snapshot: &ActivePaneSnapshot) -> String {
-    let mut context = format!(
-        "Focused pane context (this may be the assistant pane, not the original source pane):\n\
-         - window_id={}\n\
-         - tab_id={}\n\
-         - pane_id={}\n",
-        snapshot.window_id, snapshot.tab_id, snapshot.pane_id
-    );
-
-    if let Some(title) = &snapshot.title {
-        context.push_str(&format!("         - title={}\n", title));
-    }
-    if let Some(profile) = &snapshot.profile {
-        context.push_str(&format!("         - profile={}\n", profile));
-    }
-    if let Some(line_count) = snapshot.line_count {
-        context.push_str(&format!("         - captured_line_count={}\n", line_count));
-    }
-    if snapshot.truncated {
-        context.push_str("         - captured_output_truncated=true\n");
-    }
-
-    if let Some(content) = &snapshot.content {
-        context.push_str("         - recent pane content:\n");
-        context.push_str("```text\n");
-        context.push_str(&truncate_for_prompt(content, ACTIVE_PANE_CONTEXT_MAX_CHARS));
-        if !content.ends_with('\n') {
-            context.push('\n');
-        }
-        context.push_str("```\n");
-    }
-
-    context
-}
-
-async fn live_active_pane_context(shell_mgr: &ShellManager) -> Option<String> {
-    let snapshot = shell_mgr
-        .wt_active_pane_snapshot(Some(ACTIVE_PANE_CONTEXT_MAX_LINES))
-        .await
-        .ok()?;
-    Some(format_active_pane_context(&snapshot))
-}
-
 fn format_pane_context_summary(pane_context: Option<&PaneContext>) -> String {
     match pane_context {
         Some(context) => format!(
@@ -795,6 +751,12 @@ async fn build_terminal_context_json(
 
             for pane in panes_arr {
                 let pane_id = json_str_or_num(pane.get("pane_id"))?;
+
+                // Skip the agent pane entirely — no need to expose it in context
+                if coordinator_target.as_deref() == Some(pane_id.as_str()) {
+                    continue;
+                }
+
                 let pid = pane.get("pid").and_then(|value| value.as_u64());
                 let is_active = pane
                     .get("is_active")
@@ -825,7 +787,6 @@ async fn build_terminal_context_json(
                 } else {
                     None
                 };
-                let is_coordinator_target = coordinator_target.as_deref() == Some(pane_id.as_str());
 
                 panels_json.push(serde_json::json!({
                     "id": pane_id.clone(),
@@ -836,8 +797,6 @@ async fn build_terminal_context_json(
                     "is_active": is_active,
                     "pid": pid,
                     "role": pane_role,
-                    "isCoordinatorTarget": is_coordinator_target,
-                    "sendPromptAllowed": !is_coordinator_target,
                     "cwd": if source_pane_id.as_deref() == Some(pane_id.as_str()) { source_cwd.clone() } else { None },
                     "buffer": buffer,
                 }));
@@ -854,9 +813,8 @@ async fn build_terminal_context_json(
         }
     }
 
-    serde_json::to_string_pretty(&serde_json::json!({
+    serde_json::to_string(&serde_json::json!({
         "activeTarget": active_pane_id,
-        "coordinatorTarget": coordinator_target,
         "sourceTarget": source_pane_id,
         "sourceTabId": source_tab_id,
         "sourceWindowId": source_window_id,
@@ -892,10 +850,10 @@ async fn build_prompt_text(
     );
 
     let agents_started = std::time::Instant::now();
-    let supported_agents_json = serde_json::to_string_pretty(&default_supported_delegate_agents())
+    let supported_agents_json = serde_json::to_string(&default_supported_delegate_agents())
         .unwrap_or_else(|_| "[]".to_string());
     runtime_sections.push(format!(
-        "## Supported Delegate Agents\n```json\n{}\n```",
+        "### Supported Delegate Agents\n```json\n{}\n```",
         supported_agents_json
     ));
     prompt_timing_log(
@@ -920,7 +878,7 @@ async fn build_prompt_text(
         );
         if let Some(terminal_context_json) = terminal_context_json {
             runtime_sections.push(format!(
-                "## Terminal Context JSON\n```json\n{}\n```",
+                "### Terminal Context JSON\n```json\n{}\n```",
                 terminal_context_json
             ));
         }
@@ -931,25 +889,6 @@ async fn build_prompt_text(
             "terminal_context_skipped",
             "wt_connected=false",
         );
-    }
-
-    let active_pane_started = std::time::Instant::now();
-    let active_pane = live_active_pane_context(shell_mgr).await;
-    prompt_timing_log(
-        prompt_id,
-        submitted_at_unix_s,
-        "active_pane_context_ready",
-        &format!(
-            "present={} dt={:.3}s",
-            active_pane.is_some(),
-            active_pane_started.elapsed().as_secs_f64()
-        ),
-    );
-    if let Some(active_pane) = active_pane {
-        runtime_sections.push(format!(
-            "## Focused Pane Context\n{}",
-            active_pane.trim_end()
-        ));
     }
 
     let assemble_started = std::time::Instant::now();

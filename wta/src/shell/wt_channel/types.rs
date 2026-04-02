@@ -15,7 +15,8 @@ pub(crate) struct WireRequest<'a> {
 /// Received as: `{"type":"response","id":"...","result":...,"error":...}\n`
 #[derive(Debug, Deserialize)]
 pub(crate) struct WireResponse {
-    pub id: String,
+    #[serde(default)]
+    pub id: Option<String>,
     pub result: Option<serde_json::Value>,
     pub error: Option<WireError>,
 }

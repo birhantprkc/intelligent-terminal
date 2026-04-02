@@ -1,27 +1,25 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::sync::{mpsc, Mutex};
 
+use crate::app::DebugMessage;
 use super::types::{WireRequest, WireResponse};
 use super::WtChannel;
-use crate::app::DebugMessage;
 
 /// Named-pipe channel to the Windows Terminal protocol server.
 ///
 /// Connects to `\\.\pipe\WindowsTerminal-<PID>` using env var `WT_PIPE_NAME`.
 /// `WT_MCP_TOKEN` is optional — if missing, sends empty string (dev bypass).
-/// Debug logging to `wta-pipe-debug.log` is opt-in via `WTA_DEBUG_LOG=1`.
+/// Debug logging to `wta-pipe-debug.log` is enabled by default.
 pub struct PipeChannel {
     pipe: Mutex<tokio::net::windows::named_pipe::NamedPipeClient>,
     next_id: AtomicU64,
     available: AtomicBool,
     debug_log: Option<Mutex<std::fs::File>>,
     debug_tx: Option<mpsc::UnboundedSender<DebugMessage>>,
-    debug_enabled: Option<Arc<AtomicBool>>,
 }
 
 impl PipeChannel {
@@ -29,11 +27,10 @@ impl PipeChannel {
     ///
     /// Reads `WT_PIPE_NAME` from environment (required).
     /// `WT_MCP_TOKEN` is optional — defaults to empty string for dev bypass.
-    /// Debug log is written to `wta-pipe-debug.log` only when `WTA_DEBUG_LOG=1`.
+    /// Debug log is always written to `wta-pipe-debug.log` unless `WTA_DEBUG_LOG=0`.
     pub async fn connect() -> anyhow::Result<Self> {
-        let pipe_name = std::env::var("WT_PIPE_NAME").context(
-            "WT_PIPE_NAME not set. Must run inside a Windows Terminal pane with protocol access.",
-        )?;
+        let pipe_name = std::env::var("WT_PIPE_NAME")
+            .context("WT_PIPE_NAME not set. Must run inside a Windows Terminal pane with protocol access.")?;
         // Token is optional for dev — empty string triggers the dev bypass in WT.
         let token = std::env::var("WT_MCP_TOKEN").unwrap_or_default();
 
@@ -47,15 +44,16 @@ impl PipeChannel {
             .open(pipe_name)
             .context(format!("Failed to connect to pipe: {}", pipe_name))?;
 
-        let debug_log = if std::env::var("WTA_DEBUG_LOG").as_deref() == Ok("1") {
+        // Debug log is ON by default. Set WTA_DEBUG_LOG=0 to disable.
+        let debug_log = if std::env::var("WTA_DEBUG_LOG").as_deref() == Ok("0") {
+            None
+        } else {
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(crate::runtime_paths::runtime_log_path("wta-pipe-debug.log"))
+                .open("wta-pipe-debug.log")
                 .ok();
             file.map(Mutex::new)
-        } else {
-            None
         };
 
         let channel = Self {
@@ -64,7 +62,6 @@ impl PipeChannel {
             available: AtomicBool::new(false),
             debug_log,
             debug_tx: None,
-            debug_enabled: None,
         };
 
         channel
@@ -93,23 +90,12 @@ impl PipeChannel {
     }
 
     /// Attach a debug message sender for the TUI debug panel.
-    pub fn with_debug_sender(
-        mut self,
-        tx: mpsc::UnboundedSender<DebugMessage>,
-        enabled: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn with_debug_sender(mut self, tx: mpsc::UnboundedSender<DebugMessage>) -> Self {
         self.debug_tx = Some(tx);
-        self.debug_enabled = Some(enabled);
         self
     }
 
     fn emit_debug(&self, direction: crate::app::DebugDir, content: String) {
-        let Some(enabled) = &self.debug_enabled else {
-            return;
-        };
-        if !enabled.load(Ordering::Relaxed) {
-            return;
-        }
         if let Some(ref tx) = self.debug_tx {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -134,7 +120,33 @@ impl PipeChannel {
         }
     }
 
+    /// Read a single line from the pipe. Returns the raw string (without newline).
+    /// Used by the `listen` subcommand to receive push events.
+    pub async fn read_line(&self) -> anyhow::Result<String> {
+        let mut pipe = self.pipe.lock().await;
+        let buf = Self::read_line_raw(&mut pipe).await?;
+        let line = String::from_utf8(buf)?;
+        self.log(&format!("<<< {}", line)).await;
+        Ok(line)
+    }
+
+    /// Read a single newline-terminated line from the pipe (caller must hold lock).
+    async fn read_line_raw(
+        pipe: &mut tokio::net::windows::named_pipe::NamedPipeClient,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(4096);
+        loop {
+            let byte = pipe.read_u8().await?;
+            if byte == b'\n' {
+                break;
+            }
+            buf.push(byte);
+        }
+        Ok(buf)
+    }
+
     /// Core request implementation with full logging.
+    /// Skips interleaved event messages and only returns the matching response.
     async fn request_inner(
         &self,
         method: &str,
@@ -159,28 +171,36 @@ impl PipeChannel {
         // Write request
         pipe.write_all(json.as_bytes()).await?;
 
-        // Read response line (byte-by-byte until \n)
-        let mut buf = Vec::with_capacity(4096);
+        // Read lines until we get a response (skip interleaved events).
         loop {
-            let byte = pipe.read_u8().await?;
-            if byte == b'\n' {
-                break;
+            let buf = Self::read_line_raw(&mut pipe).await?;
+
+            let line_str = String::from_utf8_lossy(&buf);
+            self.log(&format!("<<< {}", line_str)).await;
+            self.emit_debug(crate::app::DebugDir::Received, line_str.to_string());
+
+            // Skip empty lines
+            if buf.is_empty() {
+                continue;
             }
-            buf.push(byte);
+
+            // Try to parse as a generic JSON to check the type field.
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf) {
+                if v.get("type").and_then(|t| t.as_str()) == Some("event") {
+                    // This is a push event, not our response. Skip it.
+                    continue;
+                }
+            }
+
+            let resp: WireResponse = serde_json::from_slice(&buf)
+                .with_context(|| format!("Failed to parse response from Windows Terminal: {}", String::from_utf8_lossy(&buf)))?;
+
+            if let Some(err) = resp.error {
+                bail!("WT protocol error [{}]: {}", err.code, err.message);
+            }
+
+            return Ok(resp.result.unwrap_or(serde_json::Value::Null));
         }
-
-        let resp_str = String::from_utf8_lossy(&buf);
-        self.log(&format!("<<< {}", resp_str)).await;
-        self.emit_debug(crate::app::DebugDir::Received, resp_str.to_string());
-
-        let resp: WireResponse = serde_json::from_slice(&buf)
-            .context("Failed to parse response from Windows Terminal")?;
-
-        if let Some(err) = resp.error {
-            bail!("WT protocol error [{}]: {}", err.code, err.message);
-        }
-
-        Ok(resp.result.unwrap_or(serde_json::Value::Null))
     }
 }
 
