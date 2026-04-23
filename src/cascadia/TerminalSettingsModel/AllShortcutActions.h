@@ -117,8 +117,7 @@
     ON_ALL_ACTIONS(OpenCWD)                 \
     ON_ALL_ACTIONS(OpenAgentPane)           \
     ON_ALL_ACTIONS(TriggerAutofix)          \
-    ON_ALL_ACTIONS(ShowProtocolInfo)         \
-    ON_ALL_ACTIONS(InitShellIntegration)
+    ON_ALL_ACTIONS(ShowProtocolInfo)
 
 #define ALL_SHORTCUT_ACTIONS_WITH_ARGS             \
     ON_ALL_ACTIONS_WITH_ARGS(AdjustFontSize)       \
@@ -163,8 +162,7 @@
     ON_ALL_ACTIONS_WITH_ARGS(Suggestions)          \
     ON_ALL_ACTIONS_WITH_ARGS(SelectCommand)        \
     ON_ALL_ACTIONS_WITH_ARGS(SelectOutput)         \
-    ON_ALL_ACTIONS_WITH_ARGS(ColorSelection)       \
-    ON_ALL_ACTIONS_WITH_ARGS(InitShellIntegration)
+    ON_ALL_ACTIONS_WITH_ARGS(ColorSelection)
 
 // These two macros here are for actions that we only use as internal currency.
 // They don't need to be parsed by the settings model, or saved as actions to

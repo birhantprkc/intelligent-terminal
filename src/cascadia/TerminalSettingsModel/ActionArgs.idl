@@ -492,10 +492,4 @@ namespace Microsoft.Terminal.Settings.Model
         WindowsPowerShell
     };
 
-    [default_interface] runtimeclass InitShellIntegrationArgs : IActionArgs, IActionArgsDescriptorAccess
-    {
-        InitShellIntegrationArgs(ShellIntegrationTarget target);
-        ShellIntegrationTarget Target { get; };
-    };
-
 }

@@ -52,6 +52,8 @@ namespace Microsoft.Terminal.Settings.Editor
         PERMANENT_OBSERVABLE_PROJECTED_SETTING(String, DelegateModel);
         PERMANENT_OBSERVABLE_PROJECTED_SETTING(Boolean, AutoFixEnabled);
 
+        event Windows.Foundation.TypedEventHandler<AIAgentsViewModel, Microsoft.Terminal.Settings.Model.ShellIntegrationTarget> InitShellIntegrationRequested;
+
         IInspectable CurrentAgentPanePosition;
         Windows.Foundation.Collections.IObservableVector<EnumEntry> AgentPanePositionList { get; };
     }

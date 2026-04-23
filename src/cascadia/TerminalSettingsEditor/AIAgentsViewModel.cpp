@@ -450,6 +450,30 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
         }
     }
 
+    // ── AutoFix ──────────────────────────────────────────────────────────
+
+    bool AIAgentsViewModel::AutoFixEnabled() const
+    {
+        return _GlobalSettings.AutoFixEnabled();
+    }
+
+    void AIAgentsViewModel::AutoFixEnabled(bool value)
+    {
+        if (_GlobalSettings.AutoFixEnabled() == value) return;
+        _GlobalSettings.AutoFixEnabled(value);
+        _NotifyChanges(L"HasAutoFixEnabled", L"AutoFixEnabled");
+        if (value)
+        {
+            InitShellIntegrationRequested.raise(*this, ShellIntegrationTarget::Pwsh);
+            InitShellIntegrationRequested.raise(*this, ShellIntegrationTarget::WindowsPowerShell);
+        }
+    }
+
+    bool AIAgentsViewModel::HasAutoFixEnabled() const
+    {
+        return _GlobalSettings.HasAutoFixEnabled();
+    }
+
     // ── Pane position ────────────────────────────────────────────────────
 
     IObservableVector<Editor::EnumEntry> AIAgentsViewModel::AgentPanePositionList()

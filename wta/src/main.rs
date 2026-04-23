@@ -1389,6 +1389,7 @@ async fn run_attach_tui(
             let (prompt_tx, prompt_rx) = tokio::sync::mpsc::unbounded_channel();
             let (recommendation_tx, recommendation_rx) = tokio::sync::mpsc::unbounded_channel();
             let (permission_tx, permission_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (dismiss_autofix_tx, dismiss_autofix_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
             let debug_capture_enabled = Arc::new(AtomicBool::new(false));
 
             // Crossterm event reader.
@@ -1455,6 +1456,7 @@ async fn run_attach_tui(
                     prompt_rx,
                     recommendation_rx,
                     permission_rx,
+                    dismiss_autofix_rx,
                     pane_context.clone(),
                     initial_prompt.clone(),
                     debug_capture_enabled.clone(),
@@ -1472,6 +1474,7 @@ async fn run_attach_tui(
                 true, // shared_mode
                 autofix_enabled,
             );
+            app_state.dismiss_autofix_tx = Some(dismiss_autofix_tx);
 
             // If preflight failed, enter Setup mode with static guidance
             // (no retry — user must close and reopen the agent pane).

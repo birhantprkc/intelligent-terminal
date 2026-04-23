@@ -1705,16 +1705,6 @@ namespace winrt::TerminalApp::implementation
         args.Handled(true);
     }
 
-    void TerminalPage::_HandleInitShellIntegration(const IInspectable& /*sender*/,
-                                                    const ActionEventArgs& args)
-    {
-        if (const auto& realArgs = args.ActionArgs().try_as<InitShellIntegrationArgs>())
-        {
-            _InitShellIntegration(realArgs.Target());
-            args.Handled(true);
-        }
-    }
-
     safe_void_coroutine TerminalPage::_InitShellIntegration(const ShellIntegrationTarget target)
     {
         const auto weak = get_weak();
@@ -1917,13 +1907,6 @@ if (-not $Global:__ShellInteg_Installed) {
 
         if (alreadyConfigured)
         {
-            co_await wil::resume_foreground(dispatcher);
-            if (auto strong = weak.get())
-            {
-                strong->_ShowShellIntegrationDialog(
-                    RS_(L"InitShellIntegrationAlreadyConfiguredTitle"),
-                    RS_(L"InitShellIntegrationAlreadyConfiguredMessage"));
-            }
             co_return;
         }
 
@@ -2011,6 +1994,11 @@ if (-not $Global:__ShellInteg_Installed) {
                 RS_(L"InitShellIntegrationSuccessTitle"),
                 RS_(L"InitShellIntegrationSuccessMessage"));
         }
+    }
+
+    void TerminalPage::_OnSettingsInitShellIntegration(const IInspectable& /*sender*/, const ShellIntegrationTarget target)
+    {
+        _InitShellIntegration(target);
     }
 
     void TerminalPage::_ShowShellIntegrationDialog(const winrt::hstring& title, const winrt::hstring& message)

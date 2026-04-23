@@ -101,6 +101,10 @@ pub enum HostClientRequest {
     ExecuteArmedAutofix {
         source_pane_id: String,
     },
+    /// Sent by the attach TUI when the user presses ESC to dismiss a fix card.
+    /// Host clears its autofix state and emits autofix_state:cleared so the
+    /// bottom bar returns to Idle.
+    DismissAutofix,
     RespondPermission {
         option_id: String,
     },
@@ -424,6 +428,7 @@ pub async fn run_attach_client(
     mut prompt_rx: mpsc::UnboundedReceiver<PromptSubmission>,
     mut recommendation_rx: mpsc::UnboundedReceiver<crate::coordinator::ChoiceExecution>,
     mut permission_rx: mpsc::UnboundedReceiver<String>,
+    mut dismiss_autofix_rx: mpsc::UnboundedReceiver<()>,
     pane_context: PaneContext,
     initial_prompt: Option<String>,
     debug_capture_enabled: Arc<AtomicBool>,
@@ -434,6 +439,7 @@ pub async fn run_attach_client(
         &mut prompt_rx,
         &mut recommendation_rx,
         &mut permission_rx,
+        &mut dismiss_autofix_rx,
         pane_context,
         initial_prompt,
         debug_capture_enabled,
@@ -655,6 +661,7 @@ async fn run_attach_client_inner(
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptSubmission>,
     recommendation_rx: &mut mpsc::UnboundedReceiver<crate::coordinator::ChoiceExecution>,
     permission_rx: &mut mpsc::UnboundedReceiver<String>,
+    dismiss_autofix_rx: &mut mpsc::UnboundedReceiver<()>,
     pane_context: PaneContext,
     initial_prompt: Option<String>,
     debug_capture_enabled: Arc<AtomicBool>,
@@ -785,6 +792,15 @@ async fn run_attach_client_inner(
                     &debug_capture_enabled,
                     &mut writer,
                     &HostClientRequest::RespondPermission { option_id },
+                ).await?;
+            }
+
+            Some(()) = dismiss_autofix_rx.recv() => {
+                send_host_request(
+                    &event_tx,
+                    &debug_capture_enabled,
+                    &mut writer,
+                    &HostClientRequest::DismissAutofix,
                 ).await?;
             }
 
@@ -1305,6 +1321,27 @@ fn handle_host_command(
                     broadcast_snapshot(clients, &state.snapshot());
                 }
                 emit_cleared();
+            }
+            HostClientRequest::DismissAutofix => {
+                let armed_pane_id = state
+                    .current_prompt_pane_context
+                    .as_ref()
+                    .and_then(|c| c.source_pane_id.clone());
+                if state.current_prompt_is_autofix || state.recommendations.is_some() {
+                    state.autofix_generation = state.autofix_generation.wrapping_add(1);
+                    if let Some(pane_id) = armed_pane_id {
+                        let cleared_evt = serde_json::json!({
+                            "type": "event",
+                            "method": "autofix_state",
+                            "params": { "state": "cleared", "pane_id": pane_id }
+                        });
+                        crate::app::send_wt_protocol_event(cleared_evt.to_string());
+                    }
+                    state.recommendations = None;
+                    state.current_prompt_is_autofix = false;
+                    state.current_prompt_pane_context = None;
+                    broadcast_snapshot(clients, &state.snapshot());
+                }
             }
             HostClientRequest::RespondPermission { option_id } => {
                 if let Some(responder) = state.permission_responder.take() {

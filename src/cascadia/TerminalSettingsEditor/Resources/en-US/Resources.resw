@@ -746,8 +746,8 @@
     <comment>Header for the toggle that enables automatic fix suggestions when commands fail.</comment>
   </data>
   <data name="AIAgents_AutoFix.HelpText" xml:space="preserve">
-    <value>Automatically suggest fixes when commands fail in monitored panes.</value>
-    <comment>Supplementary description for the auto-fix setting.</comment>
+    <value>When enabled, automatically suggest fixes when commands fail. Also installs OSC 133 shell integration into your PowerShell and Windows PowerShell profiles so command exit codes are detected. Restart PowerShell after enabling for changes to take effect.</value>
+    <comment>Supplementary description for the auto-fix setting. Explains that enabling also sets up shell integration in both PowerShell profiles.</comment>
   </data>
   <data name="AIAgents_PanePosition.Header" xml:space="preserve">
     <value>Agent Pane Position</value>

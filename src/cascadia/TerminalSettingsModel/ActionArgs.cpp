@@ -50,7 +50,6 @@
 #include "SelectCommandArgs.g.cpp"
 #include "SelectOutputArgs.g.cpp"
 #include "ColorSelectionArgs.g.cpp"
-#include "InitShellIntegrationArgs.g.cpp"
 
 #include <WtExeUtils.h>
 #include <ScopedResourceLoader.h>
@@ -1054,16 +1053,4 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
         }
         return {};
     }
-    winrt::hstring InitShellIntegrationArgs::GenerateName(const winrt::WARC::ResourceContext& context) const
-    {
-        switch (Target())
-        {
-        case ShellIntegrationTarget::Pwsh:
-            return RS_switchable_(L"InitShellIntegrationPwshCommandKey");
-        case ShellIntegrationTarget::WindowsPowerShell:
-            return RS_switchable_(L"InitShellIntegrationWindowsPowerShellCommandKey");
-        }
-        return {};
-    }
-
 }

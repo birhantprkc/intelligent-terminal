@@ -250,6 +250,11 @@ namespace winrt::TerminalApp::implementation
     // - tab: the Tab to update the title for.
     void TerminalPage::_UpdateTabIcon(Tab& tab)
     {
+        // Don't change the icon when an agent pane has focus — same as title.
+        if (const auto activePane = tab.GetActivePane(); activePane && activePane->IsAgentPane())
+        {
+            return;
+        }
         if (const auto content{ tab.GetActiveContent() })
         {
             const auto& icon{ content.Icon() };

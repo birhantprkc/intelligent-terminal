@@ -601,7 +601,14 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
             }
             else if (*clickedItemTag == aiAgentsTag)
             {
-                contentFrame().Navigate(xaml_typename<Editor::AIAgents>(), winrt::make<NavigateToPageArgs>(winrt::make<AIAgentsViewModel>(_settingsClone.GlobalSettings()), *this, elementToFocus));
+                auto aiAgentsVm = winrt::make<AIAgentsViewModel>(_settingsClone.GlobalSettings());
+                aiAgentsVm.InitShellIntegrationRequested([weak = get_weak()](auto&&, auto target) {
+                    if (auto s = weak.get())
+                    {
+                        s->InitShellIntegrationRequested.raise(*s, target);
+                    }
+                });
+                contentFrame().Navigate(xaml_typename<Editor::AIAgents>(), winrt::make<NavigateToPageArgs>(aiAgentsVm, *this, elementToFocus));
                 _breadcrumbs.Append(winrt::make<Breadcrumb>(vm, RS_(L"Nav_AIAgents/Content"), BreadcrumbSubPage::None));
             }
             else if (*clickedItemTag == globalProfileTag)

@@ -6272,6 +6272,8 @@ namespace winrt::TerminalApp::implementation
         auto sui = settingsContent->SettingsUI();
         _settingsMainPage = sui;
 
+        sui.InitShellIntegrationRequested({ get_weak(), &TerminalPage::_OnSettingsInitShellIntegration });
+
         if (_hostingHwnd)
         {
             sui.SetHostingWindow(reinterpret_cast<uint64_t>(*_hostingHwnd));

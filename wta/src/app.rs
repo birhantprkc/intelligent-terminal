@@ -381,6 +381,8 @@ pub struct App {
     // Auto-fix: the pane ID where the error occurred (used to auto-fill Send parent)
     pub autofix_pane_id: Option<String>,
     pub autofix_enabled: bool,
+    // In shared mode the host owns autofix_pane_id; this sender asks it to dismiss.
+    pub dismiss_autofix_tx: Option<mpsc::UnboundedSender<()>>,
     // Generation counter: incremented on every new trigger or cancel.
     // AgentMessageEnd responses whose generation doesn't match are discarded.
     autofix_generation: u64,
@@ -455,6 +457,7 @@ impl App {
             autofix_enabled,
             autofix_generation: 0,
             inflight_autofix_generation: None,
+            dismiss_autofix_tx: None,
         }
     }
 
@@ -1245,7 +1248,16 @@ impl App {
                 self.progress_status = None;
                 self.inflight_autofix_generation = None;
                 if let Some(p) = pane {
+                    // Non-shared mode: we own the state, emit directly.
                     self.emit_autofix_state_cleared(&p);
+                } else if self.shared_mode {
+                    // Shared mode: host owns autofix state and is the one that
+                    // emitted autofix_state:armed to the bottom bar. Ask it to
+                    // clear so the badge resets and the stale snapshot (with
+                    // recommendations) is replaced.
+                    if let Some(ref tx) = self.dismiss_autofix_tx {
+                        let _ = tx.send(());
+                    }
                 }
             }
             KeyCode::Esc if self.input.is_empty() => {

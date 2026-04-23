@@ -72,11 +72,15 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
         PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, AcpModel);
         bool ShowDelegateModel();
         PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, DelegateModel);
-        PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, AutoFixEnabled);
+        bool AutoFixEnabled() const;
+        void AutoFixEnabled(bool value);
+        bool HasAutoFixEnabled() const;
 
         winrt::Windows::Foundation::Collections::IObservableVector<winrt::Microsoft::Terminal::Settings::Editor::EnumEntry> AgentPanePositionList();
         winrt::Windows::Foundation::IInspectable CurrentAgentPanePosition();
         void CurrentAgentPanePosition(const winrt::Windows::Foundation::IInspectable& value);
+
+        til::typed_event<Editor::AIAgentsViewModel, Model::ShellIntegrationTarget> InitShellIntegrationRequested;
 
     private:
         Model::GlobalAppSettings _GlobalSettings;

@@ -161,6 +161,7 @@
                 <ToggleSwitch IsOn="{x:Bind ViewModel.AutoFixEnabled, Mode=TwoWay}"
                               Style="{StaticResource ToggleSwitchInExpanderStyle}" />
             </local:SettingContainer>
+
         </StackPanel>
     </StackPanel>
 </Page>

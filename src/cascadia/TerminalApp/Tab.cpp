@@ -473,6 +473,12 @@ namespace winrt::TerminalApp::implementation
         {
             return _runtimeTabText;
         }
+        // When an agent pane has focus, freeze the tab title at its current value
+        // rather than showing the agent process's working directory.
+        if (_activePane->IsAgentPane())
+        {
+            return Title();
+        }
         if (!_activePane->_IsLeaf())
         {
             return RS_(L"MultiplePanes");
