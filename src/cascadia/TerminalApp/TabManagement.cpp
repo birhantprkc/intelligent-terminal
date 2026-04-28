@@ -207,22 +207,21 @@ namespace winrt::TerminalApp::implementation
         }
 
         // Auto-start the single shared wta pane (hidden) the first time a
-        // terminal tab is created in this window. Deferred so it runs after
-        // the tab creation completes — avoids interfering with COM callers.
+        // terminal tab is created in this window.
+        //
+        // Previously we deferred this via Dispatcher().RunAsync() to avoid
+        // interfering with COM callers, but both Low and Normal priorities
+        // were observed to be starved during WT startup — wta would not
+        // actually spawn until the user pressed Ctrl+Shift+. (which drained
+        // the dispatcher queue). That defeats the purpose of pre-warming.
+        //
+        // _InitializeTab itself already runs on the UI thread dispatcher,
+        // and _AutoCreateHiddenAgentPane only does local work (filesystem
+        // path detection + creating + hiding a child pane), so it is safe
+        // to call synchronously here.
         if (!_agentPane.lock())
         {
-            auto weakSelf = get_weak();
-            auto weakTab = make_weak(newTabImpl);
-            Dispatcher().RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Low,
-                [weakSelf, weakTab]() {
-                    if (auto self = weakSelf.get())
-                    {
-                        if (auto tab = weakTab.get())
-                        {
-                            self->_AutoCreateHiddenAgentPane(tab);
-                        }
-                    }
-                });
+            _AutoCreateHiddenAgentPane(newTabImpl);
         }
     }
 

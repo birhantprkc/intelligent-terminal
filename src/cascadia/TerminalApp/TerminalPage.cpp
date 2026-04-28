@@ -5,6 +5,8 @@
 #include "pch.h"
 #include "TerminalPage.h"
 
+#include <iomanip>
+
 #include <json/json.h>
 #include <TerminalCore/ControlKeyStates.hpp>
 #include <TerminalThemeHelpers.h>
@@ -862,10 +864,18 @@ namespace winrt::TerminalApp::implementation
         const auto logPath = logDir + L"\\wta-agent-pane.log";
         if (auto f = std::ofstream(logPath, std::ios::app))
         {
-            const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::system_clock::now().time_since_epoch())
-                                 .count();
-            f << "[" << (now / 1000.0) << "] " << msg << "\n";
+            // Use ISO8601 UTC with millisecond precision so log timestamps can
+            // be correlated with wta-main.log down to the millisecond.
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+            const auto secs = static_cast<std::time_t>(nowMs / 1000);
+            const int ms = static_cast<int>(nowMs % 1000);
+            std::tm tmUtc{};
+            ::gmtime_s(&tmUtc, &secs);
+            char ts[32];
+            std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tmUtc);
+            f << "[" << ts << "." << std::setw(3) << std::setfill('0') << ms << "Z] " << msg << "\n";
         }
     }
 
@@ -1206,13 +1216,70 @@ namespace winrt::TerminalApp::implementation
             globals.AgentPanePosition());
         tab->SplitPaneAtRoot(splitDirection, newPane);
 
-        // Immediately hide — wta runs in background. Toggle with Ctrl+Shift+.
-        if (const auto rootPane = tab->GetRootPane())
+        // CRITICAL: do NOT hide synchronously here. TermControl spawns its
+        // ConPty connection (which is what actually launches wta.exe) only
+        // after SwapChainPanel.LayoutUpdated fires — which requires the
+        // control to be in the visual tree long enough to lay out. Calling
+        // HidePane() removes _root.Children() immediately, so the layout
+        // never happens, and the connection never starts. Result: wta.exe
+        // doesn't actually spawn until the user later restores the pane via
+        // Ctrl+Shift+. — at which point they wait the full 5–7 s for ACP
+        // session creation, defeating the whole point of pre-warming.
+        //
+        // Instead: hook the TermControl's Initialized event (raised at the
+        // end of _InitializeTerminal, immediately after connection.Start()),
+        // and only hide AFTER that fires. By that point wta.exe is already
+        // running and ACP init is in flight, so by the time the user opens
+        // the pane it's almost always Connected.
+        std::weak_ptr<Pane> weakNewPane = newPane;
+        std::weak_ptr<Pane> weakRootPane = tab->GetRootPane();
+        auto weakSelfForHide = get_weak();
+        if (const auto termControl = newPane->GetTerminalControl())
         {
-            rootPane->HidePane(newPane);
+            // Use a shared event_token holder so the lambda can revoke
+            // itself after firing once.
+            auto tokenHolder = std::make_shared<winrt::event_token>();
+            *tokenHolder = termControl.Initialized([
+                weakNewPane,
+                weakRootPane,
+                weakSelfForHide,
+                termControlWeak = winrt::make_weak(termControl),
+                tokenHolder
+            ](auto&& /*sender*/, auto&& /*args*/) {
+                _agentPaneLog("_AutoCreateHiddenAgentPane: TermControl Initialized — hiding pane now");
+                if (const auto tc = termControlWeak.get())
+                {
+                    tc.Initialized(*tokenHolder);
+                }
+                if (auto self = weakSelfForHide.get())
+                {
+                    if (auto rootPane = weakRootPane.lock())
+                    {
+                        if (auto pane = weakNewPane.lock())
+                        {
+                            rootPane->HidePane(pane);
+                            self->_UpdateBottomBarState();
+                        }
+                    }
+                }
+            });
+        }
+        else
+        {
+            // No TermControl on the new pane (shouldn't happen for a
+            // terminal-content pane). Fall back to the old immediate-hide
+            // behavior to avoid leaving a visible auto-created pane.
+            _agentPaneLog("_AutoCreateHiddenAgentPane: no TermControl on new pane, hiding immediately");
+            if (const auto rootPane = tab->GetRootPane())
+            {
+                rootPane->HidePane(newPane);
+            }
         }
 
         // Return focus to the terminal pane that was active before the split.
+        // (The new agent pane will steal focus briefly while it lays out, but
+        // the Initialized handler above only hides it — focus restoration is
+        // separate, and is also done from the existing focus path below.)
         if (const auto& ctl = tab->GetActiveTerminalControl())
         {
             ctl.Focus(winrt::Windows::UI::Xaml::FocusState::Programmatic);
@@ -1790,6 +1857,20 @@ namespace winrt::TerminalApp::implementation
     safe_void_coroutine TerminalPage::_CompleteInitialization()
     {
         _startupState = StartupState::Initialized;
+
+        // Belt-and-suspenders: also try to auto-create the hidden agent pane
+        // here. _InitializeTab already calls _AutoCreateHiddenAgentPane
+        // synchronously when the first tab is created, but if for any reason
+        // that didn't run (e.g. the first tab was a non-terminal content type
+        // and didn't have a TerminalControl), this gives us a second chance
+        // on the first focused terminal tab.
+        if (!_agentPane.lock())
+        {
+            if (const auto firstTab = _GetFocusedTabImpl())
+            {
+                _AutoCreateHiddenAgentPane(firstTab);
+            }
+        }
 
         // GH#632 - It's possible that the user tried to create the terminal
         // with only one tab, with only an elevated profile. If that happens,
@@ -2729,6 +2810,15 @@ namespace winrt::TerminalApp::implementation
             // Fix ready — execute it.
             _TriggerAutofix();
             break;
+        case AutofixState::Suggested:
+            // No executable fix — auto-fix produced an explanation that lives
+            // in the agent pane chat history. Open the pane so the user can
+            // read it, then drop back to Idle (the suggestion has been "seen").
+            _OpenOrReuseAgentPane(L"");
+            _diagnostics.autofixState = AutofixState::Idle;
+            _diagnostics.suggestionTitle.clear();
+            _UpdateBottomBarState();
+            break;
         case AutofixState::Pending:
             // Analysis in flight — show the agent pane so the user can watch
             // progress. Keep Pending state until WTA confirms armed/cleared.
@@ -2871,6 +2961,40 @@ namespace winrt::TerminalApp::implementation
                     box_value(winrt::hstring{ tooltip }));
                 break;
             }
+            case AutofixState::Suggested:
+            {
+                diagBtn.Opacity(1.0);
+                diagBtn.IsEnabled(true);
+
+                // Blue info color — distinct from Armed's yellow ("there's
+                // something to read", not "there's something to apply").
+                const auto info = SolidColorBrush{
+                    ColorHelper::FromArgb(255, 0x4F, 0xC3, 0xF7)
+                };
+                if (icon)
+                {
+                    icon.Foreground(info);
+                }
+                if (label)
+                {
+                    label.Text(L"Suggestion ready — open agent pane");
+                    label.Foreground(info);
+                    label.Visibility(Visibility::Visible);
+                }
+
+                std::wstring tooltip = L"Auto-fix declined to fix this directly. ";
+                if (!_diagnostics.suggestionTitle.empty())
+                {
+                    tooltip += L"\n";
+                    tooltip += _diagnostics.suggestionTitle;
+                    tooltip += L"\n";
+                }
+                tooltip += L"Click here or press Ctrl+Shift+. to open the agent pane and read the full suggestion.";
+                ToolTipService::SetToolTip(
+                    diagBtn,
+                    box_value(winrt::hstring{ tooltip }));
+                break;
+            }
             case AutofixState::Idle:
             default:
             {
@@ -2928,10 +3052,15 @@ namespace winrt::TerminalApp::implementation
         {
             _diagnostics.autofixState = AutofixState::Armed;
         }
+        else if (state == "suggested")
+        {
+            _diagnostics.autofixState = AutofixState::Suggested;
+        }
         else if (state == "cleared")
         {
             _diagnostics.autofixState = AutofixState::Idle;
             _diagnostics.fixPreview.clear();
+            _diagnostics.suggestionTitle.clear();
         }
         if (params.isMember("pane_id") && params["pane_id"].isString())
         {
@@ -2947,6 +3076,11 @@ namespace winrt::TerminalApp::implementation
         {
             const auto s = params["hotkey_hint"].asString();
             _diagnostics.hotkeyHint.assign(s.begin(), s.end());
+        }
+        if (params.isMember("suggestion_title") && params["suggestion_title"].isString())
+        {
+            const auto s = params["suggestion_title"].asString();
+            _diagnostics.suggestionTitle.assign(s.begin(), s.end());
         }
         _UpdateBottomBarState();
     }

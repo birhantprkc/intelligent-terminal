@@ -392,6 +392,10 @@ pub struct App {
     pub show_notification_banner: bool,
     // Auto-fix: the pane ID where the error occurred (used to auto-fill Send parent)
     pub autofix_pane_id: Option<String>,
+    // Auto-fix Suggested state: pane ID with a non-actionable suggestion shown on
+    // the bottom bar. Cleared when the user runs a successful command in the
+    // same pane (signal that they've moved on) or when a new autofix triggers.
+    pub suggested_pane_id: Option<String>,
     pub autofix_enabled: bool,
     // Generation counter: incremented on every new trigger or cancel.
     // AgentMessageEnd responses whose generation doesn't match are discarded.
@@ -465,6 +469,7 @@ impl App {
             wt_notifications: VecDeque::new(),
             show_notification_banner: false,
             autofix_pane_id: None,
+            suggested_pane_id: None,
             autofix_enabled,
             autofix_generation: 0,
             inflight_autofix_generation: None,
@@ -1071,6 +1076,13 @@ impl App {
                                 self.prompt_in_flight = false;
                                 self.agent_streaming = false;
                                 self.progress_status = None;
+                                self.emit_autofix_state_cleared(&pane);
+                            }
+                            // Same idea for the Suggested state: a successful next
+                            // command means the user moved on, so dismiss the
+                            // suggestion indicator on the bottom bar.
+                            if is_exit_zero && self.suggested_pane_id.as_deref() == Some(pane_id.as_str()) {
+                                let pane = self.suggested_pane_id.take().unwrap();
                                 self.emit_autofix_state_cleared(&pane);
                             }
                         }
@@ -1724,6 +1736,10 @@ impl App {
         self.clear_recommendations();
         self.agent_streaming = false;
         self.prompt_in_flight = false;
+        // A new analysis supersedes any leftover suggestion. The C++ side
+        // will swap to Pending on the new pending event below; emitting an
+        // explicit cleared first would create a flicker.
+        self.suggested_pane_id = None;
 
         // The auto-fix kind is carried by PromptSubmission::is_autofix,
         // so the text doesn't need a marker prefix — just the raw error
@@ -1857,6 +1873,22 @@ impl App {
             "params": {
                 "state": "cleared",
                 "pane_id": pane_id,
+            }
+        });
+        send_wt_protocol_event(evt.to_string());
+    }
+
+    /// Bottom bar shows "Suggestion ready — open agent pane" (blue/info style).
+    /// The full explanation lives in the agent pane chat history; the protocol
+    /// event only carries the title used as the bar label.
+    fn emit_autofix_state_suggested(&self, pane_id: &str, title: &str) {
+        let evt = serde_json::json!({
+            "type": "event",
+            "method": "autofix_state",
+            "params": {
+                "state": "suggested",
+                "pane_id": pane_id,
+                "suggestion_title": title,
             }
         });
         send_wt_protocol_event(evt.to_string());
@@ -2075,6 +2107,40 @@ impl App {
                 self.recommendations = Some(recommendations);
                 self.selection_visible_pending = true;
                 FinalizeOutcome::SelectionReady
+            }
+            AutofixDecision::Explain { title, explanation } => {
+                self.log_selection_phase(
+                    "autofix_explain",
+                    &format!(
+                        "pane={pane_id} title={title:?} chars={}",
+                        explanation.chars().count()
+                    ),
+                );
+
+                // Stage the explanation as a chat turn so opening the agent
+                // pane reveals it. The autofix prompt is internal so we use a
+                // human-readable label as the turn's "prompt" line.
+                let turn_prompt = format!("Auto-diagnosed error in pane {pane_id}");
+                let mut details = self.current_turn_details();
+                details.push(ChatMessage::Agent(explanation));
+                self.pending_completed_turn = Some(CompletedTurn {
+                    prompt: turn_prompt,
+                    details,
+                });
+                self.commit_pending_completed_turn();
+
+                self.emit_autofix_state_suggested(&pane_id, &title);
+
+                // No executable action to remember, but keep `suggested_pane_id`
+                // so a successful next command in the same pane can dismiss the
+                // bottom bar indicator.
+                self.suggested_pane_id = Some(pane_id.clone());
+                self.autofix_pane_id = None;
+                self.clear_recommendations();
+                self.prompt_in_flight = false;
+                self.progress_status = None;
+                self.agent_streaming = false;
+                FinalizeOutcome::None
             }
             AutofixDecision::Ignore => {
                 self.log_selection_phase("autofix_ignore", &format!("pane={pane_id}"));

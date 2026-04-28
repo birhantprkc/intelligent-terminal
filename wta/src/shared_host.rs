@@ -1047,7 +1047,11 @@ fn handle_host_command(
             let has_armed_recs = state.recommendations.is_some()
                 && !state.current_prompt_is_autofix
                 && armed_pane == Some(pane_id.as_str());
-            if matches || has_armed_recs {
+            // And clear if a Suggested indicator is shown for this pane:
+            // a successful next command means the user moved on.
+            let has_suggestion =
+                state.suggested_pane_id.as_deref() == Some(pane_id.as_str());
+            if matches || has_armed_recs || has_suggestion {
                 // Bump generation to stale any still-running agent response.
                 // Do NOT clear inflight_autofix_generation here: if the agent
                 // is still streaming, AgentMessageEnd must see Some(old_gen) !=
@@ -1061,6 +1065,7 @@ fn handle_host_command(
                 crate::app::send_wt_protocol_event(cleared_evt.to_string());
                 state.recommendations = None;
                 state.current_prompt_is_autofix = false;
+                state.suggested_pane_id = None;
                 // Clear context so a still-running agent response won't re-arm.
                 state.current_prompt_pane_context = None;
                 broadcast_snapshot(clients, &state.snapshot());
@@ -1128,6 +1133,10 @@ fn handle_host_command(
                     state.inflight_autofix_generation = Some(state.autofix_generation);
                     // Clear any armed recommendations from a previous error.
                     state.recommendations = None;
+                    // A new autofix run supersedes any leftover suggestion;
+                    // the C++ side will swap to Pending as soon as it sees the
+                    // pending event below.
+                    state.suggested_pane_id = None;
                 }
 
                 state.record_prompt_submission(
@@ -1608,6 +1617,11 @@ struct HostSessionState {
     // Used to emit `autofix_state:armed` directly from the host when the
     // attach TUI isn't running (agent pane closed / never opened).
     current_prompt_is_autofix: bool,
+    // Pane currently displaying a Suggested-state bottom bar (auto-fix produced
+    // a non-actionable explanation). Cleared when the user runs a successful
+    // command in that pane (signal that they moved on) or when a new autofix
+    // prompt supersedes the suggestion.
+    suggested_pane_id: Option<String>,
     current_prompt_submitted_at_unix_s: Option<f64>,
     // Generation counter for cancel semantics: incremented on every new trigger
     // or explicit cancel. AgentMessageEnd responses that don't match are discarded.
@@ -1642,6 +1656,7 @@ impl HostSessionState {
             current_prompt_pane_context: None,
             current_prompt_text: None,
             current_prompt_is_autofix: false,
+            suggested_pane_id: None,
             current_prompt_submitted_at_unix_s: None,
             autofix_generation: 0,
             inflight_autofix_generation: None,
@@ -2036,6 +2051,29 @@ impl HostSessionState {
                 self.stage_completed_turn(text);
                 self.recommendations = Some(recommendations);
                 FinalizeOutcome::SelectionReady
+            }
+            AutofixDecision::Explain { title, explanation } => {
+                if let Some(pane_id) = source_pane.as_ref() {
+                    let evt = serde_json::json!({
+                        "type": "event", "method": "autofix_state",
+                        "params": {
+                            "state": "suggested",
+                            "pane_id": pane_id,
+                            "suggestion_title": title,
+                        }
+                    });
+                    crate::app::send_wt_protocol_event(evt.to_string());
+                    // Track the pane so a later exit-zero in the same pane can
+                    // dismiss the indicator (see ClearAutofixForPane).
+                    self.suggested_pane_id = Some(pane_id.clone());
+                }
+                // Surface the explanation in agent pane chat history so users
+                // who open the pane (via the bottom bar prompt) see the full
+                // suggestion.
+                self.stage_completed_turn(explanation);
+                self.recommendations = None;
+                self.current_prompt_pane_context = None;
+                FinalizeOutcome::None
             }
             AutofixDecision::Ignore => {
                 if let Some(pane_id) = source_pane.as_ref() {

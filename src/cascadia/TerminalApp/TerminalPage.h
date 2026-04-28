@@ -303,16 +303,18 @@ namespace winrt::TerminalApp::implementation
         // --- Bottom bar (AI toolbar) ---
         enum class AutofixState
         {
-            Idle,    // no error pending
-            Pending, // error detected, WTA is generating a fix
-            Armed,   // fix ready — click or Ctrl+. executes it
+            Idle,      // no error pending
+            Pending,   // error detected, WTA is generating a fix
+            Armed,     // fix ready — click or Ctrl+. executes it
+            Suggested, // analysis ready but no auto-fix — click opens agent pane
         };
         struct DiagnosticState
         {
             std::wstring lastErrorPaneId;
             AutofixState autofixState{ AutofixState::Idle };
-            std::wstring fixPreview;
-            std::wstring hotkeyHint;
+            std::wstring fixPreview;        // Armed
+            std::wstring hotkeyHint;        // Armed
+            std::wstring suggestionTitle;   // Suggested
         };
         DiagnosticState _diagnostics;
         bool _agentPaneVisible{ false };
