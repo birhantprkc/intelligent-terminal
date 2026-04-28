@@ -60,7 +60,6 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(dot, dot_style),
         Span::raw(" "),
         Span::styled(label, Style::new().fg(Color::White)),
-        Span::styled(" ∨", theme::DIM),
     ];
 
     frame.render_widget(

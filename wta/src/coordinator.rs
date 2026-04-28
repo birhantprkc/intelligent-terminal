@@ -851,20 +851,58 @@ fn coordinator_log(msg: &str) {
 
 fn extract_json_code_block(text: &str) -> Option<&str> {
     let start = text.find("```json").or_else(|| text.find("```JSON"))?;
-    let after_marker = &text[start + 7..];
-    let trimmed = after_marker.strip_prefix('\r').unwrap_or(after_marker);
-    let trimmed = trimmed.strip_prefix('\n').unwrap_or(trimmed);
-    let end = trimmed.find("```")?;
-    Some(trimmed[..end].trim())
+    let mut body = &text[start + 7..];
+    if let Some(b) = body.strip_prefix('\r') {
+        body = b;
+    }
+    if let Some(b) = body.strip_prefix('\n') {
+        body = b;
+    }
+    extract_balanced_json_object(body)
 }
 
 fn extract_first_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end <= start {
-        return None;
+    extract_balanced_json_object(text)
+}
+
+/// Returns the substring spanning the first balanced JSON object in `text`.
+///
+/// Walks the input as bytes, tracking string state and brace depth so that
+/// braces or fence markers (```) inside JSON string values do not terminate
+/// the scan early. Byte indexing is safe because we only land on ASCII
+/// characters (`{`, `}`, `"`, `\`).
+fn extract_balanced_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for j in start..bytes.len() {
+        let c = bytes[j];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+        } else {
+            match c {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(text[start..=j].trim());
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    Some(text[start..=end].trim())
+    None
 }
 
 #[cfg(test)]
@@ -1192,6 +1230,47 @@ mod tests {
             parse_recommendation_set(text).expect("single-choice recommendation should parse");
         assert_eq!(parsed.choices.len(), 1);
         assert_eq!(parsed.choices[0].choice, 1);
+    }
+
+    #[test]
+    fn parse_recommendations_handles_backticks_inside_string_values() {
+        // Regression: a JSON string value that contains a triple-backtick fence
+        // marker (e.g. an `input` prompt asking another agent to emit a
+        // ```mermaid block) used to terminate the ```json fence early, leaving
+        // the JSON truncated and unparseable.
+        let text = r#"Sure, here's the plan.
+
+```json
+{
+  "recommended_choice": 1,
+  "choices": [
+    {
+      "choice": 1,
+      "title": "Delegate to Copilot",
+      "actions": [
+        {
+          "type": "open_and_send",
+          "target": "tab",
+          "agent": "copilot",
+          "cwd": "C:\\repo",
+          "input": "Produce a Mermaid flowchart (```mermaid) showing the main flow.",
+          "title": "Explore project"
+        }
+      ]
+    }
+  ]
+}
+```"#;
+
+        let parsed = parse_recommendation_set(text)
+            .expect("recommendation with backticks in string should parse");
+        assert_eq!(parsed.choices.len(), 1);
+        match &parsed.choices[0].actions[0] {
+            RecommendedAction::OpenAndSend { input, .. } => {
+                assert!(input.contains("```mermaid"));
+            }
+            other => panic!("expected OpenAndSend, got {other:?}"),
+        }
     }
 
     #[test]
