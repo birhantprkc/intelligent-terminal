@@ -145,6 +145,83 @@ impl WtNotification {
     }
 }
 
+/// Route a parsed `agent_event` payload into the AgentSessionRegistry.
+///
+/// Returns `true` if the registry was updated and the UI should redraw.
+pub fn route_agent_event_to_registry(
+    reg: &mut crate::agent_sessions::AgentSessionRegistry,
+    pane_session_id: &str,
+    params: &serde_json::Value,
+) -> bool {
+    use crate::agent_sessions::{CliSource, SessionEvent};
+    use std::path::PathBuf;
+
+    // The COM broadcast wraps the hook payload as:
+    //   { "event": "agent.tool.starting",
+    //     "cli_source": "claude",
+    //     "agent_session_id": "...",
+    //     "payload": { ...original hook stdin... } }
+    let event = params.get("event").and_then(|v| v.as_str()).unwrap_or("");
+    if !event.starts_with("agent.") {
+        return false;
+    }
+
+    let cli_source = CliSource::parse(params.get("cli_source").and_then(|v| v.as_str()));
+    let asid       = params.get("agent_session_id").and_then(|v| v.as_str()).unwrap_or("");
+    let key        = reg.resolve_or_synthesize_key(asid, pane_session_id);
+
+    let payload = params.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+    let cwd = payload.get("cwd")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let cwd_label = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let title_for_synth = format!("{:?} — {}", cli_source, cwd_label);
+
+    // Synthesize SessionStarted on first sighting since the hooks plugin
+    // doesn't ship a session-start hook (PreToolUse always fires before any
+    // user-visible activity).
+    let session_known = reg.has_session(&key);
+    let needs_synthetic_start = event != "agent.session.started" && !session_known;
+    if needs_synthetic_start {
+        reg.apply(SessionEvent::SessionStarted {
+            key: key.clone(),
+            cli_source: cli_source.clone(),
+            pane_session_id: pane_session_id.to_string(),
+            cwd: cwd.clone(),
+            title: title_for_synth.clone(),
+        });
+    }
+
+    let ev = match event {
+        "agent.session.started" => SessionEvent::SessionStarted {
+            key,
+            cli_source,
+            pane_session_id: pane_session_id.to_string(),
+            cwd,
+            title: title_for_synth,
+        },
+        "agent.tool.starting" => SessionEvent::ToolStarting {
+            key,
+            tool_name: payload.get("tool_name").or_else(|| payload.get("toolName"))
+                .and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        },
+        "agent.tool.completed" => SessionEvent::ToolCompleted { key },
+        "agent.notification"   => SessionEvent::Notification {
+            key,
+            message: payload.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        },
+        "agent.session.stopped" => SessionEvent::SessionStopped {
+            key,
+            reason: payload.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        },
+        _ => return reg.take_dirty(),
+    };
+
+    reg.apply(ev);
+    reg.take_dirty()
+}
+
 /// Classify a WT protocol event into a notification.
 pub fn classify_wt_event(method: &str, session_id: &str, params: &serde_json::Value) -> WtNotification {
     match method {
@@ -398,6 +475,8 @@ pub struct App {
     // Source pane context (from WTA_SOURCE_* env vars set by WT)
     pub source_session_id: Option<String>,
     pub source_cwd: Option<String>,
+    // Agent session registry (tracks CLI-agent panes)
+    pub agent_sessions: crate::agent_sessions::AgentSessionRegistry,
     current_prompt_text: Option<String>,
     pending_completed_turn: Option<CompletedTurn>,
     // WT event notifications
@@ -483,6 +562,7 @@ impl App {
             window_id: None,
             source_session_id: None,
             source_cwd: None,
+            agent_sessions: crate::agent_sessions::AgentSessionRegistry::new(),
             current_prompt_text: None,
             pending_completed_turn: None,
             wt_notifications: VecDeque::new(),
@@ -1055,6 +1135,16 @@ impl App {
                 // Must check before same-pane skip: agent events originate from
                 // hooks in the agent's own pane, so session_id would match ours.
                 if method == "agent_event" {
+                    // Track CLI-agent sessions in OTHER panes (not WTA's own pane).
+                    // The chat-display below logs ALL agent events, including ours.
+                    if self.pane_session_id.as_deref() != Some(session_id.as_str()) {
+                        let _ = route_agent_event_to_registry(
+                            &mut self.agent_sessions,
+                            &session_id,
+                            &params,
+                        );
+                    }
+
                     if let Some(event_type) = params.get("event").and_then(|v| v.as_str()) {
                         if event_type.starts_with("agent.") {
                             if self.log_agent_events {
@@ -1069,6 +1159,31 @@ impl App {
                 if self.pane_session_id.as_deref() == Some(session_id.as_str()) {
                     tracing::debug!(target: "autofix", "skipped: own pane");
                     return;
+                }
+
+                // Route connection_state into the registry as well as classify_wt_event.
+                if method == "connection_state" {
+                    use crate::agent_sessions::SessionEvent;
+                    let state = params.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                    match state {
+                        "failed" => {
+                            let reason = params.get("reason")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("connection failed").to_string();
+                            self.agent_sessions.apply(SessionEvent::ConnectionFailed {
+                                pane_session_id: session_id.clone(),
+                                reason,
+                            });
+                        }
+                        "closed" => {
+                            self.agent_sessions.apply(SessionEvent::PaneClosed {
+                                pane_session_id: session_id.clone(),
+                            });
+                        }
+                        _ => {}
+                    }
+                    let _ = self.agent_sessions.take_dirty();
+                    // fall through to classify_wt_event for autofix
                 }
 
                 let notification = classify_wt_event(&method, &session_id, &params);
@@ -2906,7 +3021,9 @@ mod tests {
         let (recommendation_tx, _recommendation_rx) = tokio::sync::mpsc::unbounded_channel();
         let (permission_tx, _permission_rx) = tokio::sync::mpsc::unbounded_channel();
         let debug_capture = Arc::new(AtomicBool::new(false));
-        App::new(prompt_tx, recommendation_tx, permission_tx, debug_capture, true, true, false)
+        let mut app = App::new(prompt_tx, recommendation_tx, permission_tx, debug_capture, true, true, false);
+        app.agent_sessions = crate::agent_sessions::AgentSessionRegistry::new();
+        app
     }
 
     // ─── word boundary helpers ──────────────────────────────────────────────
@@ -3340,5 +3457,46 @@ mod tests {
         assert!(rendered.contains("Bash"), "expected tool name in: {}", rendered);
         assert!(rendered.contains("Tool:"), "expected Tool: line (not default arm) in: {}", rendered);
         assert!(rendered.contains("Result:"), "expected Result: line (not default arm) in: {}", rendered);
+    }
+
+    // ─── route_agent_event_to_registry ──────────────────────────────────────
+
+    #[test]
+    fn route_agent_event_creates_session_on_tool_starting() {
+        use crate::agent_sessions::AgentSessionRegistry;
+        let mut reg = AgentSessionRegistry::new();
+        let pane = "00000000-0000-0000-0000-000000000001";
+        let params = serde_json::json!({
+            "event": "agent.tool.starting",
+            "cli_source": "claude",
+            "agent_session_id": "abc",
+            "payload": {"tool_name": "bash", "cwd": "/work"}
+        });
+        let dirty = route_agent_event_to_registry(&mut reg, pane, &params);
+        assert!(dirty);
+        assert!(reg.has_session(&"abc".to_string()));
+    }
+
+    #[test]
+    fn route_agent_event_falls_back_to_pane_keyed_placeholder() {
+        use crate::agent_sessions::AgentSessionRegistry;
+        let mut reg = AgentSessionRegistry::new();
+        let pane = "00000000-0000-0000-0000-000000000001";
+        let params = serde_json::json!({
+            "event": "agent.tool.starting",
+            "cli_source": "copilot",
+            "payload": {"tool_name": "bash"}
+        });
+        route_agent_event_to_registry(&mut reg, pane, &params);
+        assert!(reg.has_session(&format!("pane:{}", pane)));
+    }
+
+    #[test]
+    fn route_agent_event_ignores_non_agent_events() {
+        use crate::agent_sessions::AgentSessionRegistry;
+        let mut reg = AgentSessionRegistry::new();
+        let params = serde_json::json!({"event": "something.else"});
+        let dirty = route_agent_event_to_registry(&mut reg, "p", &params);
+        assert!(!dirty);
     }
 }
