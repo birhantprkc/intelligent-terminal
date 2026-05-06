@@ -1304,7 +1304,6 @@ PREVIEWLABEL
 PREVIEWWINDOW
 PREVLINE
 prg
-PRIs
 processhost
 PROCESSINFOCLASS
 PRODEXT
@@ -1991,7 +1990,6 @@ Ccc
 cplusplus
 ctl
 Debian
-Dotnet
 drv
 endptr
 evt
@@ -1999,8 +1997,6 @@ Fullwidth
 gitlab
 hdr
 idl
-IME
-INBOX
 Ioctl
 KVM
 lbl
@@ -2010,10 +2006,8 @@ NONINFRINGEMENT
 oss
 outdir
 pri
-Prioritization
 rcv
 segfault
-Sourced
 SWP
 Tbl
 testname
