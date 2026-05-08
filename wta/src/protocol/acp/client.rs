@@ -2,6 +2,7 @@ use super::prompt;
 use acp::Agent as _;
 use agent_client_protocol as acp;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -569,25 +570,32 @@ fn complete_prompt_request<T, E: std::fmt::Display>(
     result: std::result::Result<T, E>,
     prompt_timing: &PromptTimingState,
     event_tx: &mpsc::UnboundedSender<AppEvent>,
+    session_id: String,
 ) {
     match result {
         Ok(_) => {
             let timing_note = prompt_timing.complete(true, None);
             if let Some(note) = timing_note {
-                let _ = event_tx.send(AppEvent::TimingMetric(note));
+                let _ = event_tx.send(AppEvent::TimingMetric {
+                    session_id: session_id.clone(),
+                    note,
+                });
             }
-            let _ = event_tx.send(AppEvent::AgentMessageEnd);
+            let _ = event_tx.send(AppEvent::AgentMessageEnd { session_id });
         }
         Err(e) => {
             let error_message = e.to_string();
             let timing_note = prompt_timing.complete(false, Some(&error_message));
             if let Some(note) = timing_note {
-                let _ = event_tx.send(AppEvent::TimingMetric(note));
+                let _ = event_tx.send(AppEvent::TimingMetric {
+                    session_id: session_id.clone(),
+                    note,
+                });
             }
-            let _ = event_tx.send(AppEvent::AgentError(format!(
-                "prompt error: {}",
-                error_message
-            )));
+            let _ = event_tx.send(AppEvent::AgentError {
+                session_id: Some(session_id),
+                message: format!("prompt error: {}", error_message),
+            });
         }
     }
 }
@@ -1160,6 +1168,7 @@ impl acp::Client for WtaClient {
         args: acp::RequestPermissionRequest,
     ) -> acp::Result<acp::RequestPermissionResponse> {
         acp_log(&format!("request_permission: {:?}", args.tool_call.fields.title));
+        let session_id = args.session_id.0.to_string();
         let description = args
             .tool_call
             .fields
@@ -1181,6 +1190,7 @@ impl acp::Client for WtaClient {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
 
         let _ = self.state.event_tx.send(AppEvent::PermissionRequest {
+            session_id,
             description,
             options,
             responder: resp_tx,
@@ -1210,13 +1220,14 @@ impl acp::Client for WtaClient {
         self.state
             .prompt_timing
             .observe_session_update(session_update_kind(&args.update));
+        let sid = args.session_id.0.to_string();
         match args.update {
             acp::SessionUpdate::AgentThoughtChunk(chunk) => {
                 if let acp::ContentBlock::Text(text_content) = chunk.content {
-                    let _ = self
-                        .state
-                        .event_tx
-                        .send(AppEvent::AgentThoughtChunk(text_content.text));
+                    let _ = self.state.event_tx.send(AppEvent::AgentThoughtChunk {
+                        session_id: sid,
+                        text: text_content.text,
+                    });
                 }
             }
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
@@ -1224,10 +1235,10 @@ impl acp::Client for WtaClient {
                     self.state
                         .prompt_timing
                         .observe_first_text(text_content.text.len());
-                    let _ = self
-                        .state
-                        .event_tx
-                        .send(AppEvent::AgentMessageChunk(text_content.text));
+                    let _ = self.state.event_tx.send(AppEvent::AgentMessageChunk {
+                        session_id: sid,
+                        text: text_content.text,
+                    });
                 }
             }
             acp::SessionUpdate::ToolCall(tool_call) => {
@@ -1235,6 +1246,7 @@ impl acp::Client for WtaClient {
                     .prompt_timing
                     .observe_first_tool_call(Some(tool_call.title.as_str()));
                 let _ = self.state.event_tx.send(AppEvent::ToolCall {
+                    session_id: sid,
                     id: tool_call.tool_call_id.to_string(),
                     title: tool_call.title.clone(),
                     status: format!("{:?}", tool_call.status),
@@ -1243,6 +1255,7 @@ impl acp::Client for WtaClient {
             acp::SessionUpdate::ToolCallUpdate(update) => {
                 if let Some(status) = &update.fields.status {
                     let _ = self.state.event_tx.send(AppEvent::ToolCallUpdate {
+                        session_id: sid,
                         id: update.tool_call_id.to_string(),
                         status: format!("{:?}", status),
                     });
@@ -1261,7 +1274,10 @@ impl acp::Client for WtaClient {
                         },
                     })
                     .collect();
-                let _ = self.state.event_tx.send(AppEvent::Plan(entries));
+                let _ = self.state.event_tx.send(AppEvent::Plan {
+                    session_id: sid,
+                    entries,
+                });
             }
             _ => {} // Ignore other update types for now
         }
@@ -1287,10 +1303,12 @@ impl acp::Client for WtaClient {
             env,
         };
 
+        let session_id = args.session_id.0.to_string();
         match self.state.shell_mgr.create_terminal(config).await {
             Ok(id) => {
                 // Show tool-call-like feedback
                 let _ = self.state.event_tx.send(AppEvent::ToolCall {
+                    session_id,
                     id: id.clone(),
                     title: format!("{} {}", args.command, args.args.join(" ")),
                     status: "running".to_string(),
@@ -1327,11 +1345,13 @@ impl acp::Client for WtaClient {
         args: acp::WaitForTerminalExitRequest,
     ) -> acp::Result<acp::WaitForTerminalExitResponse> {
         let tid = args.terminal_id.to_string();
+        let session_id = args.session_id.0.to_string();
 
         match self.state.shell_mgr.wait_for_exit(&tid).await {
             Ok(code) => {
                 // Update tool call status
                 let _ = self.state.event_tx.send(AppEvent::ToolCallUpdate {
+                    session_id,
                     id: tid,
                     status: format!("exited ({})", code),
                 });
@@ -1394,7 +1414,10 @@ pub async fn run_acp_client(
     .await
     {
         startup_probe.log(&format!("run_acp_client failed: {:#}", e));
-        let _ = event_tx.send(AppEvent::AgentError(format!("{:#}", e)));
+        let _ = event_tx.send(AppEvent::AgentError {
+            session_id: None,
+            message: format!("{:#}", e),
+        });
     } else {
         startup_probe.log("run_acp_client completed");
     }
@@ -1671,10 +1694,80 @@ async fn run_inner(
         current_model_id,
     });
 
+    // Per-tab session cache. The startup session above is bound to tab "0"
+    // (matching `DEFAULT_TAB_ID` on the App side); other tabs lazily create
+    // a fresh ACP session on their first prompt.
+    let mut tab_to_session: HashMap<String, acp::SessionId> = HashMap::new();
+    tab_to_session.insert("0".to_string(), session_id.clone());
+
     // Prompt loop: wait for user input, send to agent
     while let Some(prompt) = prompt_rx.recv().await {
+        let tab_key = prompt
+            .pane_context
+            .as_ref()
+            .and_then(|c| c.tab_id.clone())
+            .unwrap_or_else(|| "0".to_string());
+
+        // Resolve (or lazily create) the ACP session for this tab.
+        let prompt_session_id = match tab_to_session.get(&tab_key) {
+            Some(sid) => sid.clone(),
+            None => {
+                startup_probe.log(&format!("Lazy-creating ACP session for tab {}", tab_key));
+                let cwd = prompt
+                    .pane_context
+                    .as_ref()
+                    .and_then(|c| c.cwd.clone())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let new_session = match conn
+                    .new_session(acp::NewSessionRequest::new(cwd))
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = event_tx.send(AppEvent::AgentError {
+                            session_id: None,
+                            message: format!(
+                                "new_session failed for tab {}: {}",
+                                tab_key, e
+                            ),
+                        });
+                        continue;
+                    }
+                };
+                let new_sid = new_session.session_id.clone();
+                let (per_tab_models, per_tab_current) = match &new_session.models {
+                    Some(state) => {
+                        let models: Vec<crate::app::AcpModelInfo> = state
+                            .available_models
+                            .iter()
+                            .map(|m| crate::app::AcpModelInfo {
+                                id: m.model_id.0.to_string(),
+                                name: m.name.clone(),
+                                description: m.description.clone(),
+                            })
+                            .collect();
+                        (models, Some(state.current_model_id.0.to_string()))
+                    }
+                    None => (Vec::new(), None),
+                };
+                let _ = event_tx.send(AppEvent::SessionAttached {
+                    tab_id: tab_key.clone(),
+                    session_id: new_sid.to_string(),
+                    available_models: per_tab_models,
+                    current_model_id: per_tab_current,
+                });
+                tab_to_session.insert(tab_key.clone(), new_sid.clone());
+                new_sid
+            }
+        };
+        let prompt_session_id_str = prompt_session_id.to_string();
+
         state.prompt_timing.activate(&prompt);
-        let _ = event_tx.send(AppEvent::ProgressStatus("Preparing context...".to_string()));
+        let _ = event_tx.send(AppEvent::ProgressStatus {
+            session_id: Some(prompt_session_id_str.clone()),
+            status: "Preparing context...".to_string(),
+        });
         let (text, prompt_source, prompt_name) = build_prompt_text(
             prompt.id,
             prompt.submitted_at_unix_s,
@@ -1693,15 +1786,23 @@ async fn run_inner(
             &prompt_source,
             &text,
         );
-        let _ = event_tx.send(AppEvent::ProgressStatus("Thinking...".to_string()));
+        let _ = event_tx.send(AppEvent::ProgressStatus {
+            session_id: Some(prompt_session_id_str.clone()),
+            status: "Thinking...".to_string(),
+        });
         state.prompt_timing.mark_prompt_sent();
         let result = conn
             .prompt(acp::PromptRequest::new(
-                session_id.clone(),
+                prompt_session_id.clone(),
                 vec![text.into()],
             ))
             .await;
-        complete_prompt_request(result, &state.prompt_timing, &event_tx);
+        complete_prompt_request(
+            result,
+            &state.prompt_timing,
+            &event_tx,
+            prompt_session_id_str,
+        );
     }
 
     Ok(())
@@ -1758,10 +1859,17 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let prompt_timing = PromptTimingState::default();
 
-        complete_prompt_request(Ok::<(), &str>(()), &prompt_timing, &event_tx);
+        complete_prompt_request(
+            Ok::<(), &str>(()),
+            &prompt_timing,
+            &event_tx,
+            "test-session".to_string(),
+        );
 
         match event_rx.try_recv() {
-            Ok(AppEvent::AgentMessageEnd) => {}
+            Ok(AppEvent::AgentMessageEnd { session_id }) => {
+                assert_eq!(session_id, "test-session");
+            }
             Ok(_) => panic!("expected AgentMessageEnd"),
             Err(err) => panic!("expected AgentMessageEnd, got channel error: {err}"),
         }
@@ -1773,10 +1881,16 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let prompt_timing = PromptTimingState::default();
 
-        complete_prompt_request(Err::<(), _>("boom"), &prompt_timing, &event_tx);
+        complete_prompt_request(
+            Err::<(), _>("boom"),
+            &prompt_timing,
+            &event_tx,
+            "test-session".to_string(),
+        );
 
         match event_rx.try_recv() {
-            Ok(AppEvent::AgentError(message)) => {
+            Ok(AppEvent::AgentError { session_id, message }) => {
+                assert_eq!(session_id.as_deref(), Some("test-session"));
                 assert_eq!(message, "prompt error: boom");
             }
             Ok(_) => panic!("expected AgentError"),
