@@ -27,7 +27,7 @@ use crate::coordinator::{
     RecommendationSet,
 };
 use crate::pane_context::PaneContext;
-use crate::preflight::{CheckStatus, PreflightResult};
+
 use crate::protocol::acp::client::{
     prompt_timing_log, CancelRequest, NewSessionForTab, PromptSubmission, RestartRequest,
 };
@@ -113,6 +113,35 @@ pub struct SetupState {
     pub install_log: Vec<String>,
     /// Error message from the most recent install attempt (cleared on retry).
     pub install_error: Option<String>,
+}
+
+/// Status of a single preflight check.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CheckStatus {
+    Checking,
+    Passed,
+    Failed(String),
+    Skipped,
+}
+
+/// Result of all preflight checks for an agent.
+#[derive(Debug, Clone)]
+pub struct PreflightResult {
+    pub agent_id: String,
+    pub display_name: String,
+    pub cli_status: CheckStatus,
+    pub cli_path: Option<String>,
+    pub auth_status: CheckStatus,
+    pub install_hint: String,
+    pub install_url: String,
+    pub auth_hint: String,
+}
+
+impl PreflightResult {
+    pub fn all_passed(&self) -> bool {
+        self.cli_status == CheckStatus::Passed
+            && matches!(self.auth_status, CheckStatus::Passed | CheckStatus::Skipped)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -617,8 +646,6 @@ pub enum AppEvent {
     },
     /// Background agent install completed — refresh the detected agents list.
     AgentInstallComplete(Vec<DetectedAgent>),
-    /// Auth check completed for the selected agent.
-    AuthCheckComplete(crate::auth::AuthCheckResult),
     /// Login progress — device code received, display to user.
     LoginProgress { device_code: String, verify_url: String },
     /// Login flow completed.
@@ -1417,7 +1444,8 @@ impl App {
         let new_cmd = if !profile.acp_launch_command.is_empty() {
             profile.acp_launch_command.to_string()
         } else {
-            let exe = crate::auth::find_agent_exe(profile);
+            let exe = crate::agent_check::find_exe(agent_id)
+                .unwrap_or_else(|| agent_id.to_string());
             let mut cmd = exe;
             for flag in profile.acp_flags {
                 cmd.push(' ');
@@ -1551,17 +1579,6 @@ impl App {
         }
     }
 
-    fn spawn_auth_check(&self, agent_id: &str) {
-        if let Some(ref tx) = self.event_tx {
-            let tx = tx.clone();
-            let id = agent_id.to_string();
-            tokio::task::spawn_local(async move {
-                let result = crate::auth::check_auth(&id).await;
-                let _ = tx.send(AppEvent::AuthCheckComplete(result));
-            });
-        }
-    }
-
     /// FRE setup key handler — agent selection + auth trigger.
     fn handle_fre_setup_key(&mut self, key: KeyEvent) {
         if let Some(ref mut setup) = self.setup {
@@ -1591,7 +1608,7 @@ impl App {
 
                             // Fast credential check (cmdkey / config files, no ACP probe).
                             // If found → optimistic connect. If not → auth screen directly.
-                            let has_cred = crate::auth::has_credential_fast(&agent_id);
+                            let has_cred = crate::agent_check::has_credential(&agent_id);
 
                             if has_cred {
                                 // Credential found → connect directly
@@ -1605,7 +1622,7 @@ impl App {
                                     agent_id: agent_id.clone(),
                                     agent_name,
                                     auth_hint: profile.auth_hint.to_string(),
-                                    login_command: crate::auth::build_login_command(profile),
+                                    login_command: crate::agent_check::build_login_cmd(&agent_id),
                                     checking: false,
                                     status_message: String::new(),
                                 });
@@ -1617,7 +1634,7 @@ impl App {
                                     agent_id: agent_id.clone(),
                                     agent_name,
                                     auth_hint: profile.auth_hint.to_string(),
-                                    login_command: crate::auth::build_login_command(profile),
+                                    login_command: crate::agent_check::build_login_cmd(&agent_id),
                                     checking: false,
                                     status_message: String::new(),
                                 });
@@ -1966,7 +1983,6 @@ impl App {
             AppEvent::DebugPipeMessage(_) => "debug_pipe_message",
             AppEvent::WtEvent { .. } => "wt_event",
             AppEvent::AgentInstallComplete(_) => "agent_install_complete",
-            AppEvent::AuthCheckComplete(_) => "auth_check_complete",
             AppEvent::LoginProgress { .. } => "login_progress",
             AppEvent::LoginComplete { .. } => "login_complete",
             AppEvent::PreflightComplete(_) => "preflight_complete",
@@ -2626,33 +2642,6 @@ impl App {
                     // Login failed — show auth screen again
                     if let Some(ref mut auth) = self.auth {
                         auth.checking = false;
-                    }
-                }
-            }
-            AppEvent::AuthCheckComplete(result) => {
-                use crate::auth::AuthStatus;
-                match result.status {
-                    AuthStatus::Authenticated => {
-                        // Auth OK — transition to Chat and start ACP
-                        let agent_id = self.auth.as_ref().map(|a| a.agent_id.clone()).unwrap_or_default();
-                        self.update_deferred_acp_agent(&agent_id);
-                        self.mode = AppMode::Chat;
-                        self.state = ConnectionState::Connecting("Starting agent...".to_string());
-                        self.pending_acp_start = true;
-                        self.auth = None;
-                        self.setup = None;
-                    }
-                    AuthStatus::NeedsAuth | AuthStatus::Unknown => {
-                        // Show auth screen
-                        self.mode = AppMode::Auth;
-                        self.auth = Some(AuthState {
-                            agent_id: String::new(), // filled by caller
-                            agent_name: result.agent_name,
-                            auth_hint: result.auth_hint,
-                            login_command: result.login_command,
-                            checking: false,
-                            status_message: String::new(),
-                        });
                     }
                 }
             }

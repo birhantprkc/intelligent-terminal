@@ -2,7 +2,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::App;
-use crate::preflight::CheckStatus;
+use crate::app::CheckStatus;
 
 const TITLE_STYLE: Style = Style::new()
     .fg(Color::Cyan)

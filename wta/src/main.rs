@@ -1,15 +1,14 @@
+mod agent_check;
 mod agent_registry;
 mod agent_sessions;
 mod agent_hooks_installer;
 mod app;
-mod auth;
 mod commands;
 mod coordinator;
 mod event;
 mod history_loader;
 mod logging;
 mod osc52;
-mod preflight;
 mod protocol;
 mod runtime_paths;
 mod pane_context;
@@ -1693,13 +1692,34 @@ async fn run_acp_app(
             // Skip preflight when FRE is active — FRE has its own agent
             // selection + auth flow and doesn't need the preflight wizard.
             if cli.setup.is_none() {
-                let preflight_result = preflight::check_agent(&agent_cmd).await;
+                let agent_id = agent_cmd.split_whitespace().next().unwrap_or(&agent_cmd);
+                let status = agent_check::check_agent(agent_id);
+                let preflight_result = app::PreflightResult {
+                    agent_id: status.id.clone(),
+                    display_name: status.display_name.clone(),
+                    cli_status: if status.cli_found {
+                        app::CheckStatus::Passed
+                    } else {
+                        app::CheckStatus::Failed("Not found on PATH".to_string())
+                    },
+                    cli_path: status.cli_path.clone(),
+                    auth_status: if !status.cli_found {
+                        app::CheckStatus::Skipped
+                    } else if status.has_credential {
+                        app::CheckStatus::Passed
+                    } else {
+                        app::CheckStatus::Skipped
+                    },
+                    install_hint: status.install_hint.clone(),
+                    install_url: String::new(),
+                    auth_hint: status.auth_hint.clone(),
+                };
                 tracing::info!(
                     target: "preflight",
                     agent_id = %preflight_result.agent_id,
                     cli = ?preflight_result.cli_status,
                     auth = ?preflight_result.auth_status,
-                    "preflight done"
+                    "preflight done (via agent_check)"
                 );
                 let _ = event_tx.send(app::AppEvent::PreflightComplete(preflight_result));
             }
@@ -1788,12 +1808,12 @@ async fn run_acp_app(
                     reason,
                     agents,
                     selected_index: 0,
-                    preflight: preflight::PreflightResult {
+                    preflight: app::PreflightResult {
                         agent_id: String::new(),
                         display_name: String::new(),
-                        cli_status: preflight::CheckStatus::Skipped,
+                        cli_status: app::CheckStatus::Skipped,
                         cli_path: None,
-                        auth_status: preflight::CheckStatus::Skipped,
+                        auth_status: app::CheckStatus::Skipped,
                         install_hint: String::new(),
                         install_url: String::new(),
                         auth_hint: String::new(),
@@ -1854,80 +1874,17 @@ async fn run_acp_app(
 }
 
 /// Detect which agent CLIs are available.
-/// Checks both the current process PATH (`where`) and the WinGet Links
-/// directory, since the latter may not be in PATH for packaged apps or
-/// when an agent was just installed in the same session.
+/// Delegates to `agent_check::check_all_agents()` which reads a fresh PATH
+/// from the Windows registry and checks CLI presence + credentials.
 fn detect_agents() -> Vec<app::DetectedAgent> {
-    use crate::agent_registry::KNOWN_AGENTS;
-
-    let winget_links = std::env::var("LOCALAPPDATA")
-        .ok()
-        .map(|local| {
-            std::path::PathBuf::from(local)
-                .join("Microsoft")
-                .join("WinGet")
-                .join("Links")
-        });
-
-    // npm global bin (where `npm install -g` puts executables)
-    let npm_global = std::env::var("APPDATA")
-        .ok()
-        .map(|appdata| std::path::PathBuf::from(appdata).join("npm"));
-
-    // Claude Code custom install path
-    let claude_cli = std::env::var("USERPROFILE")
-        .ok()
-        .map(|home| std::path::PathBuf::from(home).join(".claude-cli").join("CurrentVersion"));
-
-    KNOWN_AGENTS
-        .iter()
-        .map(|profile| {
-            let found = profile.exe_search_order.iter().any(|ext| {
-                let exe_name = format!("{}{}", profile.id, ext);
-
-                // 1. Check current process PATH
-                let on_path = std::process::Command::new("where")
-                    .arg(&exe_name)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-
-                // 2. Check WinGet Links directory (covers packaged apps
-                //    and freshly-installed agents in the same session)
-                let in_winget = winget_links
-                    .as_ref()
-                    .map(|dir| dir.join(&exe_name).exists())
-                    .unwrap_or(false);
-
-                // 3. Check npm global bin (npm install -g puts .cmd files here)
-                let in_npm = npm_global
-                    .as_ref()
-                    .map(|dir| dir.join(&exe_name).exists())
-                    .unwrap_or(false);
-
-                // 4. Check Claude CLI custom path (~/.claude-cli/CurrentVersion/)
-                let in_claude_cli = claude_cli
-                    .as_ref()
-                    .map(|dir| dir.join(&exe_name).exists())
-                    .unwrap_or(false);
-
-                on_path || in_winget || in_npm || in_claude_cli
-            });
-
-            let status = if profile.id == "copilot" && found {
-                "Installed by default".to_string()
-            } else if found {
-                "Detected".to_string()
-            } else {
-                "Not found".to_string()
-            };
-
+    agent_check::check_all_agents()
+        .into_iter()
+        .map(|s| {
+            let status = s.status_label();
             app::DetectedAgent {
-                name: profile.display_name.to_string(),
+                name: s.display_name,
                 status,
-                is_available: found,
+                is_available: s.cli_found,
             }
         })
         .collect()
