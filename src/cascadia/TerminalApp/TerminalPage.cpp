@@ -3724,6 +3724,32 @@ namespace winrt::TerminalApp::implementation
 
         _agentPaneLog("OnAgentStatusChanged: payload=" + winrt::to_string(eventJson).substr(0, 600));
 
+        // If WTA signals a new agent selection (e.g. from FRE or preflight),
+        // persist it to settings so the next launch uses the same agent.
+        const auto selectedAgent = pickStr("selected_agent");
+        if (!selectedAgent.empty())
+        {
+            const auto& globals = _settings.GlobalSettings();
+            if (globals.AcpAgent() != selectedAgent)
+            {
+                globals.AcpAgent(selectedAgent);
+                // Update the snapshot so _RebuildAgentStack (triggered by
+                // the file-watcher after WriteSettingsToDisk) sees no diff
+                // and skips the teardown. The current WTA pane is already
+                // connected to the right agent.
+                _lastAgentSettings.acpAgent = std::wstring{ selectedAgent };
+                try
+                {
+                    _settings.WriteSettingsToDisk();
+                }
+                catch (...)
+                {
+                    LOG_CAUGHT_EXCEPTION();
+                }
+                _agentPaneLog("OnAgentStatusChanged: persisted acpAgent=" + winrt::to_string(selectedAgent));
+            }
+        }
+
         // Sync the process-wide model-list cache. The Settings UI's
         // AIAgentsViewModel reads from this on construction, so any new
         // dropdown opened after this point sees the freshest list.

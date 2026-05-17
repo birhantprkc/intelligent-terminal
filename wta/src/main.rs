@@ -1505,6 +1505,7 @@ async fn run_acp_app(
             // selection + auth flow and doesn't need the preflight wizard.
             if cli.setup.is_none() {
                 let agent_id = agent_cmd.split_whitespace().next().unwrap_or(&agent_cmd);
+                app_state.current_agent_id = agent_check::check_agent(agent_id).id.clone();
                 let status = agent_check::check_agent(agent_id);
                 let preflight_result = app::PreflightResult {
                     agent_id: status.id.clone(),
@@ -1578,47 +1579,6 @@ async fn run_acp_app(
             if let Some(ref reason_str) = cli.setup {
                 tracing::info!("Entering FRE setup mode: reason={}", reason_str);
                 let reason = app::SetupReason::from_str(reason_str);
-                // Detect available agents on PATH
-                let mut agents = detect_agents();
-
-                // First-run: auto-install Copilot in background if not found
-                if reason == app::SetupReason::FirstRun {
-                    let copilot_found = agents.iter().any(|a| a.name == "GitHub Copilot" && a.is_available);
-                    if !copilot_found {
-                        // Show "Installing..." while winget runs
-                        for agent in &mut agents {
-                            if agent.name == "GitHub Copilot" {
-                                agent.status = "Installing...".to_string();
-                            }
-                        }
-                        let install_tx = event_tx.clone();
-                        tokio::task::spawn_local(async move {
-                            tracing::info!("first-run: Copilot not found, installing via winget...");
-                            let result = tokio::task::spawn_blocking(|| {
-                                std::process::Command::new("winget")
-                                    .args(["install", "GitHub.Copilot", "--accept-source-agreements", "--accept-package-agreements"])
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .status()
-                            })
-                            .await;
-
-                            match result {
-                                Ok(Ok(status)) if status.success() => {
-                                    tracing::info!("first-run: Copilot installed successfully");
-                                }
-                                _ => {
-                                    tracing::warn!("first-run: Copilot install failed or timed out");
-                                }
-                            }
-
-                            // Re-detect agents — detect_agents() checks both PATH
-                            // and WinGet Links, so it will find the fresh install.
-                            let updated = detect_agents();
-                            let _ = install_tx.send(app::AppEvent::AgentInstallComplete(updated));
-                        });
-                    }
-                }
 
                 app_state.mode = app::AppMode::Setup;
                 let all_agent_statuses = agent_check::check_all_agents();
@@ -1626,11 +1586,10 @@ async fn run_acp_app(
                 let title = reason.title().to_string();
                 let subtitle = match reason {
                     app::SetupReason::FirstRun => "Getting started".to_string(),
-                    _ => "Fix the issue below to continue".to_string(),
+                    _ => "Fix the issue to continue".to_string(),
                 };
                 app_state.setup = Some(app::SetupState {
                     reason,
-                    agents,
                     selected_index: 0,
                     preflight: app::PreflightResult {
                         agent_id: String::new(),
@@ -1698,21 +1657,4 @@ async fn run_acp_app(
             app_state.run(terminal, event_rx, ui_event_rx).await
         })
         .await
-}
-
-/// Detect which agent CLIs are available.
-/// Delegates to `agent_check::check_all_agents()` which reads a fresh PATH
-/// from the Windows registry and checks CLI presence + credentials.
-fn detect_agents() -> Vec<app::DetectedAgent> {
-    agent_check::check_all_agents()
-        .into_iter()
-        .map(|s| {
-            let status = s.status_label();
-            app::DetectedAgent {
-                name: s.display_name,
-                status,
-                is_available: s.cli_found,
-            }
-        })
-        .collect()
 }
