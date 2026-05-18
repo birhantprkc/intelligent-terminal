@@ -1347,6 +1347,37 @@ namespace winrt::TerminalApp::implementation
         _lastNotifiedAgentTabId.reset();
     }
 
+    std::shared_ptr<Pane> TerminalPage::_WrapInAgentPaneContent(std::shared_ptr<Pane> rawPane)
+    {
+        if (!rawPane)
+        {
+            return rawPane;
+        }
+        const auto innerTerm = rawPane->GetContent().try_as<winrt::TerminalApp::TerminalPaneContent>();
+        if (!innerTerm)
+        {
+            // Defensive fallback — shouldn't happen for a terminal-content pane.
+            _agentPaneLog("_WrapInAgentPaneContent: rawPane content is not TerminalPaneContent — using unwrapped pane");
+            return rawPane;
+        }
+        // The raw Pane's first border currently parents the TermControl;
+        // release it before AgentPaneContent re-parents it as the wrapper's
+        // ContentPresenter child. Without this, XAML throws because the
+        // TermControl would be in two visual trees at once.
+        if (const auto rootGrid = rawPane->GetRootElement())
+        {
+            if (rootGrid.Children().Size() > 0)
+            {
+                if (const auto border = rootGrid.Children().GetAt(0).try_as<winrt::Windows::UI::Xaml::Controls::Border>())
+                {
+                    border.Child(nullptr);
+                }
+            }
+        }
+        auto agentContent = winrt::make<winrt::TerminalApp::implementation::AgentPaneContent>(innerTerm);
+        return std::make_shared<Pane>(agentContent);
+    }
+
     // Move the single shared agent pane to targetTab and ensure it is visible.
     // No-op if the pane already lives in targetTab and is visible. When the
     // pane crosses tabs, also fires a tab_changed event so wta switches its
@@ -1454,12 +1485,12 @@ namespace winrt::TerminalApp::implementation
             // either, so when a pane spawns later we will fire a fresh event).
             return;
         }
-        const auto newTabIdx = _GetTabIndex(*targetTab);
-        if (!newTabIdx)
+        const auto newTabId = targetTab->StableId();
+        if (newTabId.empty())
         {
             return;
         }
-        if (_lastNotifiedAgentTabId == newTabIdx)
+        if (_lastNotifiedAgentTabId.has_value() && _lastNotifiedAgentTabId.value() == newTabId)
         {
             return;
         }
@@ -1468,10 +1499,10 @@ namespace winrt::TerminalApp::implementation
         tabEvt["type"] = "event";
         tabEvt["method"] = "tab_changed";
         Json::Value tabParams;
-        tabParams["tab_id"] = std::to_string(newTabIdx.value());
+        tabParams["tab_id"] = winrt::to_string(newTabId);
         if (_lastNotifiedAgentTabId.has_value())
         {
-            tabParams["from_tab_id"] = std::to_string(_lastNotifiedAgentTabId.value());
+            tabParams["from_tab_id"] = winrt::to_string(_lastNotifiedAgentTabId.value());
         }
         tabEvt["params"] = tabParams;
         Json::StreamWriterBuilder wb;
@@ -1480,7 +1511,113 @@ namespace winrt::TerminalApp::implementation
             *this,
             winrt::to_hstring(Json::writeString(wb, tabEvt)));
 
-        _lastNotifiedAgentTabId = newTabIdx;
+        _lastNotifiedAgentTabId = newTabId;
+    }
+
+    // Tells wta to clear the per-tab session (conversation history + ACP
+    // SessionId binding) WITHOUT dropping the TabSession key. Unlike
+    // _NotifyAgentTabClosed (which means "this tab is gone"), reset means
+    // "tab is still around, but the user wants a clean slate for it." Used
+    // by the Ctrl+C×2 path when at least one other tab still wants the
+    // agent pane: we hide the pane and reset this tab's wta state so the
+    // next toggle on this tab starts fresh.
+    void TerminalPage::_NotifyAgentTabReset(const winrt::hstring& tabId)
+    {
+        if (tabId.empty())
+        {
+            return;
+        }
+        if (!_agentPane.lock())
+        {
+            return;
+        }
+
+        Json::Value tabEvt;
+        tabEvt["type"] = "event";
+        tabEvt["method"] = "reset_tab_session";
+        Json::Value tabParams;
+        tabParams["tab_id"] = winrt::to_string(tabId);
+        tabEvt["params"] = tabParams;
+        Json::StreamWriterBuilder wb;
+        wb["indentation"] = "";
+        ProtocolVtSequenceReceived.raise(
+            *this,
+            winrt::to_hstring(Json::writeString(wb, tabEvt)));
+    }
+
+    // Tells wta that a tab has been destroyed so it can drop the per-tab
+    // TabSession (conversation history, scroll state, pending turns, etc.)
+    // and any session_to_tab routing keyed to it. No-op if there's no agent
+    // pane to talk to or the id is empty.
+    void TerminalPage::_NotifyAgentTabClosed(const winrt::hstring& tabId)
+    {
+        if (tabId.empty())
+        {
+            return;
+        }
+        if (!_agentPane.lock())
+        {
+            return;
+        }
+
+        Json::Value tabEvt;
+        tabEvt["type"] = "event";
+        tabEvt["method"] = "tab_closed";
+        Json::Value tabParams;
+        tabParams["tab_id"] = winrt::to_string(tabId);
+        tabEvt["params"] = tabParams;
+        Json::StreamWriterBuilder wb;
+        wb["indentation"] = "";
+        ProtocolVtSequenceReceived.raise(
+            *this,
+            winrt::to_hstring(Json::writeString(wb, tabEvt)));
+
+        // If this was the tab we last told wta about, drop the dedupe so the
+        // next active-tab change always re-emits tab_changed.
+        if (_lastNotifiedAgentTabId.has_value() && _lastNotifiedAgentTabId.value() == tabId)
+        {
+            _lastNotifiedAgentTabId.reset();
+        }
+    }
+
+    // Broadcast a `set_view` event to wta so it switches its TUI view
+    // (Chat / Agents). Used by Ctrl+Shift+/ to drive the wta into the
+    // Agents (session list) view when the agent pane is already alive.
+    // For a fresh pane the same effect is achieved via the
+    // `--initial-view` CLI flag passed to wta on spawn.
+    void TerminalPage::_BroadcastAgentSetView(std::string_view view)
+    {
+        Json::Value evt;
+        evt["type"] = "event";
+        evt["method"] = "set_view";
+        Json::Value params;
+        params["view"] = std::string{ view };
+        // Scope to this WT window so multi-window users with multiple
+        // wta processes don't cross-talk. wta ignores the event when its
+        // own window_id is known and doesn't match.
+        params["window_id"] = std::to_string(_WindowProperties.WindowId());
+        evt["params"] = params;
+        Json::StreamWriterBuilder wb;
+        wb["indentation"] = "";
+        _agentPaneLog(std::string{ "broadcasting set_view event: view=" } + std::string{ view });
+        ProtocolVtSequenceReceived.raise(
+            *this,
+            winrt::to_hstring(Json::writeString(wb, evt)));
+
+        // Mirror the wta-side view switch on the C++ agent bar: in sessions
+        // view, the bar replaces "<agent> <version>" with "Agent sessions"
+        // and hides the agent logo. Tied to _BroadcastAgentSetView (and not
+        // _agentSessionsViewActive directly) because every keyboard- or
+        // icon-driven switch we care about flows through here; the few
+        // remaining `_agentSessionsViewActive = false` sites are pane-closed
+        // paths where the bar is going away anyway.
+        if (const auto pane = _FindAgentPane())
+        {
+            if (const auto agent = pane->GetContent().try_as<winrt::TerminalApp::AgentPaneContent>())
+            {
+                agent.SetSessionsView(view == "sessions");
+            }
+        }
     }
 
     // Reset every tab's AgentPaneOpen() flag. Called when the shared pane is
@@ -1585,6 +1722,17 @@ namespace winrt::TerminalApp::implementation
         const auto& globals = _settings.GlobalSettings();
         std::wstring cmdline = std::wstring{ wtaPath };
 
+        // Tell wta which tab owns its pane up-front (passed as a hidden CLI
+        // arg). wta seeds app_state.tab_id from this before any ACP work
+        // starts, so AgentConnected binds the initial session directly under
+        // the right GUID and there is no DEFAULT_TAB_ID placeholder to
+        // migrate later. Tab switches after spawn still flow through
+        // _NotifyAgentTabChanged → tab_changed events.
+        if (const auto stableId = tab->StableId(); !stableId.empty())
+        {
+            cmdline += fmt::format(FMT_COMPILE(L" --owner-tab-id \"{}\""), std::wstring_view{ stableId });
+        }
+
         const auto agentCliPath = _ResolveEffectiveAgentCliPath(globals, [this]() { return _DetectAgentCli(); });
         if (!agentCliPath.empty())
         {
@@ -1680,36 +1828,7 @@ namespace winrt::TerminalApp::implementation
             _pendingProtocolPipeHandles.reset();
         }
 
-        // Wrap the raw terminal pane in an AgentPaneContent so the leaf
-        // renders the XAML agent bar above the wta TermControl. We construct
-        // a fresh Pane around the wrapper because Pane has no API to swap
-        // its content in place.
-        std::shared_ptr<Pane> newPane;
-        if (const auto innerTerm = rawPane->GetContent().try_as<winrt::TerminalApp::TerminalPaneContent>())
-        {
-            // The raw Pane's first border currently parents the TermControl;
-            // release it before AgentPaneContent re-parents it as the wrapper's
-            // ContentPresenter child. Without this, XAML throws because the
-            // TermControl would be in two visual trees at once.
-            if (const auto rootGrid = rawPane->GetRootElement())
-            {
-                if (rootGrid.Children().Size() > 0)
-                {
-                    if (const auto border = rootGrid.Children().GetAt(0).try_as<winrt::Windows::UI::Xaml::Controls::Border>())
-                    {
-                        border.Child(nullptr);
-                    }
-                }
-            }
-            auto agentContent = winrt::make<winrt::TerminalApp::implementation::AgentPaneContent>(innerTerm);
-            newPane = std::make_shared<Pane>(agentContent);
-        }
-        else
-        {
-            // Defensive fallback — shouldn't happen for a terminal-content pane.
-            _agentPaneLog("_AutoCreateHiddenAgentPane: rawPane content is not TerminalPaneContent — using unwrapped pane");
-            newPane = rawPane;
-        }
+        auto newPane = _WrapInAgentPaneContent(rawPane);
 
         newPane->IsAgentPane(true);
         _agentPane = newPane;
@@ -1896,16 +2015,31 @@ namespace winrt::TerminalApp::implementation
             _agentPaneLog("_RebuildAgentStack: already rebuilding, skipping nested trigger");
             return;
         }
+
+        // Defer the rebuild when there's no terminal tab in focus:
+        // TermControls on non-active tabs never raise
+        // SwapChainPanel.LayoutUpdated, so `connection.Start()` never
+        // runs and wta.exe never launches. _FlushPendingAgentRebuild
+        // re-enters once a terminal tab becomes active.
+        // `_lastAgentSettings` stays unchanged so the dirty diff fires
+        // again on next entry.
+        const auto focusedTab = _GetFocusedTabImpl();
+        // Only `==` auto-generates for projected WinRT types — `!=` doesn't.
+        const bool canHostPane = focusedTab && !(*focusedTab == _settingsTab);
+        if (!canHostPane)
+        {
+            _pendingAgentRebuild = true;
+            return;
+        }
+
         _agentRebuilding = true;
         auto guard = wil::scope_exit([this]() noexcept { _agentRebuilding = false; });
 
         _agentPaneLog("_RebuildAgentStack: agent settings changed, rebuilding");
 
-        // Remember the pane and the tab that owns it BEFORE teardown.
-        // Settings changes are typically authored from the Settings tab, so
-        // _GetFocusedTabImpl() points at Settings — we must not recreate the
-        // agent pane there. If no pane exists yet, just snapshot and bail —
-        // the user gets a fresh pane next time they open one.
+        // No existing pane → first launch of an agent pane in this window;
+        // nothing to tear down, just snapshot so the next launch picks up
+        // the new settings.
         const auto existingPane = _FindAgentPane();
         if (!existingPane)
         {
@@ -1913,8 +2047,7 @@ namespace winrt::TerminalApp::implementation
             _agentPaneLog("_RebuildAgentStack: no existing agent pane, snapshot only");
             return;
         }
-        const bool hadVisiblePane = !existingPane->IsHidden();
-        const auto ownerTab = _FindTabContainingAgentPane();
+        const auto previousOwnerTab = _FindTabContainingAgentPane();
 
         // Snapshot per-tab open/closed flags so the rebuild doesn't lose them
         // when the Closed handler clears them.
@@ -1931,14 +2064,12 @@ namespace winrt::TerminalApp::implementation
         _TeardownAgentPane();
         _lastAgentSettings = current;
 
-        // Recreate the hidden pane on the original tab — never on whatever
-        // happens to be focused (often Settings during a model switch).
-        if (ownerTab)
-        {
-            _AutoCreateHiddenAgentPane(ownerTab);
-        }
+        // Recreate on the active terminal tab — that's where
+        // SwapChainPanel.LayoutUpdated will fire and the ConPty
+        // connection will actually start. The pane moves between tabs
+        // on toggle anyway (see _RelocateAgentPaneToTab).
+        _AutoCreateHiddenAgentPane(focusedTab);
 
-        // Restore the per-tab flags.
         for (const auto& [tabImpl, flag] : savedFlags)
         {
             if (tabImpl)
@@ -1947,30 +2078,28 @@ namespace winrt::TerminalApp::implementation
             }
         }
 
-        // If the pane was visible before the rebuild, restore it on the
-        // *owner* tab. Going through _OpenOrReuseAgentPane would drag the
-        // pane onto the currently focused tab (Settings, when the rebuild
-        // is triggered by a model switch), which is what we just fixed.
-        if (hadVisiblePane && ownerTab)
-        {
-            if (const auto newPane = _FindAgentPane())
-            {
-                if (const auto newRoot = ownerTab->GetRootPane())
-                {
-                    newRoot->RestorePane(newPane);
-                    if (const auto paneId = newPane->Id())
-                    {
-                        ownerTab->FocusPane(paneId.value());
-                    }
-                }
-            }
-        }
+        (void)previousOwnerTab;
         _UpdateBottomBarState();
     }
 
-    void TerminalPage::_OpenOrReuseAgentPane(const winrt::hstring& prompt)
+    void TerminalPage::_FlushPendingAgentRebuild()
     {
-        _agentPaneLog("_OpenOrReuseAgentPane called, prompt='" + winrt::to_string(prompt) + "'");
+        if (!_pendingAgentRebuild)
+        {
+            return;
+        }
+        const auto focusedTab = _GetFocusedTabImpl();
+        if (!focusedTab || *focusedTab == _settingsTab)
+        {
+            return;
+        }
+        _pendingAgentRebuild = false;
+        _RebuildAgentStack();
+    }
+
+    void TerminalPage::_OpenOrReuseAgentPane(const winrt::hstring& prompt, bool intoSessionsView)
+    {
+        _agentPaneLog("_OpenOrReuseAgentPane called, prompt='" + winrt::to_string(prompt) + "', intoSessionsView=" + (intoSessionsView ? "true" : "false"));
 
         const auto& globals = _settings.GlobalSettings();
         std::wstring cmdline;
@@ -2010,6 +2139,11 @@ namespace winrt::TerminalApp::implementation
             if (!globals.AutoFixEnabled())
             {
                 cmdline += L" --no-autofix";
+            }
+
+            if (intoSessionsView)
+            {
+                cmdline += L" --initial-view sessions";
             }
         }
         else
@@ -2053,6 +2187,39 @@ namespace winrt::TerminalApp::implementation
                 return;
             }
 
+            if (intoSessionsView)
+            {
+                // Open-into-sessions semantics (Ctrl+Shift+/): never toggle
+                // closed. Force the active tab's flag on, reconcile (which
+                // moves the pane to the active tab and emits tab_changed),
+                // focus it, then broadcast set_view so wta switches the
+                // *new* active tab's TabSession into the Agents view.
+                const auto activeTab = _GetFocusedTabImpl();
+                if (!activeTab)
+                {
+                    return;
+                }
+                activeTab->AgentPaneOpen(true);
+                _agentPaneLog("intoSessionsView: forcing active tab AgentPaneOpen=true");
+                _ReconcileAgentPaneForActiveTab();
+
+                if (const auto pane = _FindAgentPane())
+                {
+                    if (const auto& content{ pane->GetContent() })
+                    {
+                        content.Focus(FocusState::Programmatic);
+                    }
+                }
+
+                // Order matters: tab_changed (raised inside reconcile via
+                // _NotifyAgentTabChanged) must reach wta before set_view so
+                // the view switch lands on the right TabSession.
+                _BroadcastAgentSetView("sessions");
+                _agentSessionsViewActive = true;
+                _UpdateBottomBarState();
+                return;
+            }
+
             // Empty prompt: per-tab toggle. Flip the active tab's flag, then
             // reconcile the shared pane against it. The pane follows the
             // active tab — switching tabs preserves each tab's open/closed
@@ -2066,10 +2233,38 @@ namespace winrt::TerminalApp::implementation
             activeTab->AgentPaneOpen(wantOpen);
             _agentPaneLog(std::string{ "toggle: active tab AgentPaneOpen=" } + (wantOpen ? "true" : "false"));
             _ReconcileAgentPaneForActiveTab();
+            if (wantOpen)
+            {
+                // Transitioning hidden → visible via the chat keybinding
+                // (Ctrl+Shift+.). Force wta into chat view in case it was
+                // last left in the Agents view (the pane stays alive when
+                // hidden, so wta retains its previous view). Without this
+                // the user would press the chat key and still see the
+                // session list.
+                _BroadcastAgentSetView("chat");
+            }
+            // Toggle path opens to chat (default) or hides the pane —
+            // either way the sessions view is no longer active.
+            _agentSessionsViewActive = false;
+            _UpdateBottomBarState();
             return;
         }
 
         _agentPaneLog("no existing agent pane, creating new one");
+
+        // Tell wta which tab owns this pane up-front (passed as a hidden CLI
+        // arg). wta seeds app_state.tab_id from this before any ACP work
+        // starts, so AgentConnected binds the initial session directly under
+        // the right GUID and there is no DEFAULT_TAB_ID placeholder for
+        // switch_tab_session to migrate later. Tab switches after spawn flow
+        // through _NotifyAgentTabChanged → tab_changed events as normal.
+        if (const auto focusedTab = _GetFocusedTabImpl())
+        {
+            if (const auto stableId = focusedTab->StableId(); !stableId.empty())
+            {
+                cmdline += fmt::format(FMT_COMPILE(L" --owner-tab-id \"{}\""), std::wstring_view{ stableId });
+            }
+        }
 
         // Append the initial prompt to the cmdline when creating a new pane.
         if (!prompt.empty())
@@ -2130,8 +2325,8 @@ namespace winrt::TerminalApp::implementation
         wil::unique_handle pendingWtWrite;
         const bool pipePrepared = _PrepareAgentPanePipe(pendingWtRead, pendingWtWrite);
 
-        auto newPane = _MakeTerminalPane(newTerminalArgs, nullptr, nullptr);
-        if (!newPane)
+        auto rawPane = _MakeTerminalPane(newTerminalArgs, nullptr, nullptr);
+        if (!rawPane)
         {
             _pendingProtocolPipeHandles.reset();
             return;
@@ -2150,6 +2345,11 @@ namespace winrt::TerminalApp::implementation
             _pendingProtocolPipeHandles.reset();
         }
 
+        // Wrap in AgentPaneContent so the 36px XAML agent bar renders above
+        // the wta TermControl. Without this, the post-teardown rebuild path
+        // (Ctrl+C×2 close → toggle open) would produce a pane with no
+        // title bar, and SetSessionsView below would no-op.
+        auto newPane = _WrapInAgentPaneContent(rawPane);
         newPane->IsAgentPane(true);
         _agentPane = newPane;
         {
@@ -2160,6 +2360,7 @@ namespace winrt::TerminalApp::implementation
                 {
                     self->_agentPane.reset();
                     self->_lastNotifiedAgentTabId.reset();
+                    self->_agentSessionsViewActive = false;
                     self->_ClearAllAgentPaneFlags();
                     self->_UpdateBottomBarState();
                 }
@@ -2184,6 +2385,29 @@ namespace winrt::TerminalApp::implementation
 
         // The user explicitly asked to open it on this tab.
         activeTab->AgentPaneOpen(true);
+
+        // No tab_changed needed here — wta was already told its owner tab
+        // via --owner-tab-id in the cmdline. Tab switches from here on
+        // flow through _ReconcileAgentPaneForActiveTab.
+
+        // New pane: wta starts in whichever view --initial-view requested
+        // (chat by default; sessions when Ctrl+Shift+/ triggered the open).
+        _agentSessionsViewActive = intoSessionsView;
+
+        // Mirror that view on the new agent bar's label so the title reads
+        // "Agent sessions" from the very first frame. Without this the bar
+        // would briefly show "<agent> <version>" before any user input,
+        // which is misleading when the wta TUI below is the session list.
+        if (intoSessionsView)
+        {
+            if (const auto& content{ newPane->GetContent() })
+            {
+                if (const auto agent = content.try_as<winrt::TerminalApp::AgentPaneContent>())
+                {
+                    agent.SetSessionsView(true);
+                }
+            }
+        }
 
         _UpdateBottomBarState();
     }
@@ -2551,26 +2775,78 @@ namespace winrt::TerminalApp::implementation
     }
 
     // Method Description:
-    // - Displays a dialog to warn the user that they are about to close all open windows.
-    //   Once the user clicks the OK button, shut down the application.
-    //   If cancel is clicked, the dialog will close.
+    // - Displays the unified close confirmation dialog configured for the
+    //   given scenario. Resets the "don't ask me again" checkbox before showing.
+    //   If the user confirms and checked "don't ask me again", sets
+    //   confirmOnClose to Never and writes settings to disk.
     // - Only one dialog can be visible at a time. If another dialog is visible
     //   when this is called, nothing happens. See _ShowDialog for details
-    winrt::Windows::Foundation::IAsyncOperation<ContentDialogResult> TerminalPage::_ShowQuitDialog()
+    winrt::Windows::Foundation::IAsyncOperation<ContentDialogResult> TerminalPage::_ShowConfirmCloseDialog(ConfirmCloseDialogKind kind)
     {
-        return _ShowDialogHelper(L"QuitDialog");
-    }
+        // Load the dialog (triggers x:Load) and configure its strings.
+        const auto dialog = FindName(L"ConfirmCloseDialog").as<ContentDialog>();
 
-    // Method Description:
-    // - Displays a dialog for warnings found while closing the terminal app using
-    //   key binding with multiple tabs opened. Display messages to warn user
-    //   that more than 1 tab is opened, and once the user clicks the OK button, remove
-    //   all the tabs and shut down and app. If cancel is clicked, the dialog will close
-    // - Only one dialog can be visible at a time. If another dialog is visible
-    //   when this is called, nothing happens. See _ShowDialog for details
-    winrt::Windows::Foundation::IAsyncOperation<ContentDialogResult> TerminalPage::_ShowCloseWarningDialog()
-    {
-        return _ShowDialogHelper(L"CloseAllDialog");
+        winrt::hstring title;
+        winrt::hstring primary;
+        switch (kind)
+        {
+        case ConfirmCloseDialogKind::CloseAll:
+            title = RS_(L"ConfirmCloseDialog_CloseAllTitle");
+            primary = RS_(L"ConfirmCloseDialog_CloseAllPrimary");
+            break;
+        case ConfirmCloseDialogKind::Window:
+            title = RS_(L"ConfirmCloseDialog_WindowTitle");
+            primary = RS_(L"ConfirmCloseDialog_WindowPrimary");
+            break;
+        case ConfirmCloseDialogKind::Tab:
+            title = RS_(L"ConfirmCloseDialog_TabTitle");
+            primary = RS_(L"ConfirmCloseDialog_TabPrimary");
+            break;
+        case ConfirmCloseDialogKind::MultiplePanes:
+            title = RS_(L"ConfirmCloseDialog_MultiplePanesTitle");
+            primary = RS_(L"ConfirmCloseDialog_MultiplePanesPrimary");
+            break;
+        case ConfirmCloseDialogKind::MultipleTabs:
+            title = RS_(L"ConfirmCloseDialog_MultipleTabsTitle");
+            primary = RS_(L"ConfirmCloseDialog_MultipleTabsPrimary");
+            break;
+        case ConfirmCloseDialogKind::Pane:
+            title = RS_(L"ConfirmCloseDialog_PaneTitle");
+            primary = RS_(L"ConfirmCloseDialog_PanePrimary");
+            break;
+        }
+        dialog.Title(winrt::box_value(title));
+        dialog.PrimaryButtonText(primary);
+        dialog.CloseButtonText(RS_(L"ConfirmCloseDialog_Cancel"));
+
+        // BODGY: After a ContentDialog is dismissed, FindName() can no longer
+        // resolve children inside it. Use Content() to get the checkbox directly.
+        const auto checkbox = dialog.Content().as<CheckBox>();
+        checkbox.IsChecked(false);
+
+        auto result = ContentDialogResult::None;
+        if (auto presenter{ _dialogPresenter.get() })
+        {
+            const auto weak = get_weak();
+            result = co_await presenter.ShowDialog(dialog);
+
+            // ShowDialog blocks until the dialog is dismissed, so it is
+            // possible for `this` to be torn down while we wait. Re-acquire
+            // a strong reference before touching any of our state.
+            const auto strong = weak.get();
+            if (!strong)
+            {
+                co_return ContentDialogResult::None;
+            }
+
+            if (result == ContentDialogResult::Primary && checkbox.IsChecked().Value())
+            {
+                _settings.GlobalSettings().ConfirmOnClose(ConfirmOnClose::Never);
+                _settings.WriteSettingsToDisk();
+            }
+        }
+
+        co_return result;
     }
 
     // Method Description:
@@ -3269,8 +3545,7 @@ namespace winrt::TerminalApp::implementation
 
             // Replace the Starting directory with the CWD, if given
             const auto workingDirectory = control.WorkingDirectory();
-            const auto validWorkingDirectory = !workingDirectory.empty();
-            if (validWorkingDirectory)
+            if (Utils::IsValidDirectory(workingDirectory.c_str()))
             {
                 controlSettings.DefaultSettings()->StartingDirectory(workingDirectory);
             }
@@ -3398,6 +3673,32 @@ namespace winrt::TerminalApp::implementation
         _UpdateBottomBarState();
     }
 
+    // Open (or reuse) the agent pane and switch wta into the Agents/sessions
+    // view — same toggle semantics as the Ctrl+Shift+/ keybinding:
+    //   - pane not visible on active tab → open + sessions view
+    //   - pane visible AND already in sessions view → close
+    //   - pane visible but in chat view → switch to sessions
+    void TerminalPage::_SessionToggleButtonOnClick(const IInspectable& /*sender*/,
+                                                    const RoutedEventArgs& /*eventArgs*/)
+    {
+        const auto pane = _FindAgentPane();
+        const auto activeTab = _GetFocusedTabImpl();
+        const bool visibleOnActiveTab =
+            pane && activeTab && (_FindTabContainingAgentPane() == activeTab) && !pane->IsHidden();
+
+        if (visibleOnActiveTab && _agentSessionsViewActive)
+        {
+            activeTab->AgentPaneOpen(false);
+            _ReconcileAgentPaneForActiveTab();
+            _agentSessionsViewActive = false;
+            _UpdateBottomBarState();
+            return;
+        }
+
+        _OpenOrReuseAgentPane(L"", /*intoSessionsView*/ true);
+        _UpdateBottomBarState();
+    }
+
     void TerminalPage::_DiagnosticsButtonOnClick(const IInspectable& /*sender*/,
                                                   const RoutedEventArgs& /*eventArgs*/)
     {
@@ -3471,19 +3772,25 @@ namespace winrt::TerminalApp::implementation
         }
         _agentPaneVisible = activeTabWantsOpen;
 
-        // Update AI toggle button visual — use a subtle highlight when active.
+        // The pane-visible highlight follows whichever toggle button "owns"
+        // the current view:
+        //   * chat view     → AgentToggleButton lit, SessionToggleButton dark
+        //   * sessions view → SessionToggleButton lit, AgentToggleButton dark
+        //   * pane hidden   → both dark
+        // Previously AgentToggleButton stayed lit for both views, which made
+        // the session toggle look like it never engaged when Ctrl+Shift+/
+        // opened the sessions list.
+        const auto kLitOverlay = SolidColorBrush{ ColorHelper::FromArgb(30, 255, 255, 255) };
+        const auto kTransparent = SolidColorBrush{ Colors::Transparent() };
+        const bool sessionsLit = _agentPaneVisible && _agentSessionsViewActive;
+        const bool chatLit     = _agentPaneVisible && !_agentSessionsViewActive;
         if (auto toggleBtn = AgentToggleButton())
         {
-            if (_agentPaneVisible)
-            {
-                // Subtle white overlay for both light and dark themes
-                toggleBtn.Background(SolidColorBrush{
-                    ColorHelper::FromArgb(30, 255, 255, 255) });
-            }
-            else
-            {
-                toggleBtn.Background(SolidColorBrush{ Colors::Transparent() });
-            }
+            toggleBtn.Background(chatLit ? kLitOverlay : kTransparent);
+        }
+        if (auto sessionsBtn = SessionToggleButton())
+        {
+            sessionsBtn.Background(sessionsLit ? kLitOverlay : kTransparent);
         }
 
         // Swap the toggle icon to match the current pane position.
@@ -3823,6 +4130,144 @@ namespace winrt::TerminalApp::implementation
                 agentContent.UpdateAgentStatus(name, version, model, state);
             }
         }
+    }
+
+    // Inbound event from WTA: {method:"view_changed", params:{view}}.
+    //
+    // wta is the sole driver for two view transitions C++ can't observe by
+    // itself: Esc out of the Agents picker and the `/sessions` slash command.
+    // Both flip wta's internal `current_view` without going through
+    // `_BroadcastAgentSetView`, so without this echo the agent bar title
+    // would stay on "Agent sessions" after Esc, or fail to switch to it
+    // after `/sessions`, and the bottom bar's sessions/chat highlight (which
+    // reads `_agentSessionsViewActive`) would drift out of sync.
+    //
+    // Critically we do NOT call `_BroadcastAgentSetView` here — that would
+    // emit `set_view` back to wta and create a feedback loop. We only mirror
+    // the new view onto C++ state.
+    void TerminalPage::OnAgentViewChanged(hstring eventJson)
+    {
+        Json::Value evt;
+        Json::CharReaderBuilder rb;
+        std::istringstream ss(winrt::to_string(eventJson));
+        std::string errs;
+        if (!Json::parseFromStream(rb, ss, &evt, &errs))
+        {
+            return;
+        }
+        const auto& params = evt["params"];
+        if (!params.isObject() || !params.isMember("view") || !params["view"].isString())
+        {
+            return;
+        }
+        const auto view = params["view"].asString();
+        const bool sessions = (view == "sessions");
+
+        _agentPaneLog(std::string{ "OnAgentViewChanged: view=" } + view);
+
+        _agentSessionsViewActive = sessions;
+
+        if (const auto pane = _FindAgentPane())
+        {
+            if (const auto agent = pane->GetContent().try_as<winrt::TerminalApp::AgentPaneContent>())
+            {
+                agent.SetSessionsView(sessions);
+            }
+        }
+
+        _UpdateBottomBarState();
+    }
+
+    // Inbound event from WTA: {method:"close_agent_pane", params:{...}}.
+    // User pressed Ctrl+C twice in the agent pane TUI. Two paths:
+    //
+    //   (1) Other tabs still want the agent pane (their AgentPaneOpen flag
+    //       is true). The pane is shared across all tabs, so we can't kill
+    //       wta — that would wipe every tab's ACP session. Instead we:
+    //         - tell wta to reset just THIS tab's session/conversation,
+    //         - flip THIS tab's AgentPaneOpen to false,
+    //         - hide the pane on this tab.
+    //       The wta process stays alive; switching to another tab brings
+    //       the pane back with that tab's history; toggling this tab on
+    //       again gives the user a clean slate with a fresh ACP session.
+    //
+    //   (2) No other tab wants the pane — this is the last consumer. Fall
+    //       back to the original full teardown: Pane::Close fires Closed,
+    //       _agentPane resets, ConPty SIGKILLs wta, and all in-process
+    //       state dies with it. Next toggle anywhere spawns a fresh wta.
+    void TerminalPage::OnCloseAgentPaneRequested(hstring /*eventJson*/)
+    {
+        _agentPaneLog("OnCloseAgentPaneRequested: user requested close from wta");
+        const auto agentPane = _agentPane.lock();
+        if (!agentPane)
+        {
+            _agentPaneLog("OnCloseAgentPaneRequested: no agent pane alive — no-op");
+            return;
+        }
+
+        // The pane lives on the tab containing it; that's the "current" tab
+        // from wta's perspective. Don't trust _GetFocusedTabImpl() here —
+        // the user could have switched WT tabs after pressing Ctrl+C but
+        // before the protocol event landed on the UI thread.
+        const auto ownerTab = _FindTabContainingAgentPane();
+        if (!ownerTab)
+        {
+            _agentPaneLog("OnCloseAgentPaneRequested: pane has no owner tab — falling back to full teardown");
+            _TeardownAgentPane();
+            return;
+        }
+
+        // Count other tabs that still want the agent pane. Excludes the
+        // owner tab itself.
+        bool anyOtherWantsOpen = false;
+        for (const auto& t : _tabs)
+        {
+            const auto tabImpl = _GetTabImpl(t);
+            if (!tabImpl || tabImpl == ownerTab)
+            {
+                continue;
+            }
+            if (tabImpl->AgentPaneOpen())
+            {
+                anyOtherWantsOpen = true;
+                break;
+            }
+        }
+
+        if (!anyOtherWantsOpen)
+        {
+            _agentPaneLog("OnCloseAgentPaneRequested: last tab consumer — full teardown");
+            _TeardownAgentPane();
+            return;
+        }
+
+        _agentPaneLog("OnCloseAgentPaneRequested: other tabs still want the pane — hide + reset this tab");
+
+        // Tell wta to drop this tab's ACP session + conversation. Fire this
+        // BEFORE flipping AgentPaneOpen so wta sees the reset request while
+        // its tab_to_session for ownerTab is still populated. (Order isn't
+        // strict — the events are queued — but it's the natural sequence.)
+        _NotifyAgentTabReset(ownerTab->StableId());
+
+        ownerTab->AgentPaneOpen(false);
+
+        // Only hide if the pane is currently visible on the owner tab. If
+        // it's already hidden (e.g. user switched tabs between Ctrl+C and
+        // this event), the flag-flip above is enough; reconcile will keep
+        // it hidden the next time this tab becomes active.
+        if (!agentPane->IsHidden())
+        {
+            if (const auto rootPane = ownerTab->GetRootPane())
+            {
+                rootPane->HidePane(agentPane);
+                if (const auto target = _FindSourceOfAgentPaneId(rootPane))
+                {
+                    ownerTab->FocusPane(target.value());
+                }
+            }
+        }
+
+        _UpdateBottomBarState();
     }
 
     // Send {method:"autofix_execute",params:{pane_id}} over the outbound
@@ -4534,12 +4979,13 @@ namespace winrt::TerminalApp::implementation
     //   signal that we want to close everything.
     safe_void_coroutine TerminalPage::RequestQuit()
     {
-        if (!_displayingCloseDialog)
+        const auto setting = _settings.GlobalSettings().ConfirmOnClose();
+        if (setting != ConfirmOnClose::Never && !_displayingCloseDialog)
         {
             _displayingCloseDialog = true;
 
             const auto weak = get_weak();
-            auto warningResult = co_await _ShowQuitDialog();
+            auto warningResult = co_await _ShowConfirmCloseDialog(ConfirmCloseDialogKind::CloseAll);
             const auto strong = weak.get();
             if (!strong)
             {
@@ -4552,9 +4998,9 @@ namespace winrt::TerminalApp::implementation
             {
                 co_return;
             }
-
-            QuitRequested.raise(nullptr, nullptr);
         }
+
+        QuitRequested.raise(nullptr, nullptr);
     }
 
     void TerminalPage::PersistState()
@@ -4632,12 +5078,59 @@ namespace winrt::TerminalApp::implementation
     }
 
     // Method Description:
-    // - Close the terminal app. If there is more
-    //   than one tab opened, show a warning dialog.
+    // - Determines whether a close-window action should show a confirmation
+    //   dialog, based on the confirmOnClose setting and the current window state.
+    // Arguments:
+    // - <none>
+    // Return Value:
+    // - true, if a warning dialog should be shown before closing the window
+    bool TerminalPage::_ShouldWarnOnClose() const
+    {
+        const auto setting = _settings.GlobalSettings().ConfirmOnClose();
+        switch (setting)
+        {
+        case ConfirmOnClose::Always:
+            return true;
+        case ConfirmOnClose::Automatic:
+        {
+            // Warn if there's more than one tab, or the one tab has more than one pane.
+            return _HasMultipleTabs() || _GetTabImpl(_tabs.GetAt(0))->GetLeafPaneCount() > 1;
+        }
+        case ConfirmOnClose::Never:
+        default:
+            return false;
+        }
+    }
+
+    // Method Description:
+    // - Determines whether closing a specific tab should show a confirmation
+    //   dialog, based on the confirmOnClose setting and the tab's state.
+    // Arguments:
+    // - tab: The tab being closed
+    // Return Value:
+    // - true, if a warning dialog should be shown before closing the tab
+    bool TerminalPage::_ShouldWarnOnCloseTab(const winrt::com_ptr<Tab>& tab) const
+    {
+        const auto setting = _settings.GlobalSettings().ConfirmOnClose();
+        switch (setting)
+        {
+        case ConfirmOnClose::Always:
+            return true;
+        case ConfirmOnClose::Automatic:
+            // Warn if this tab has more than one pane.
+            return tab->GetLeafPaneCount() > 1;
+        case ConfirmOnClose::Never:
+        default:
+            return false;
+        }
+    }
+
+    // Method Description:
+    // - Close the terminal app. If the confirmOnClose setting indicates we should
+    //   warn for the current window state, show a warning dialog.
     safe_void_coroutine TerminalPage::CloseWindow()
     {
-        if (_HasMultipleTabs() &&
-            _settings.GlobalSettings().ConfirmCloseAllTabs() &&
+        if (_ShouldWarnOnClose() &&
             !_displayingCloseDialog)
         {
             if (_newTabButton && _newTabButton.Flyout())
@@ -4646,7 +5139,17 @@ namespace winrt::TerminalApp::implementation
             }
             _DismissTabContextMenus();
             _displayingCloseDialog = true;
-            auto warningResult = co_await _ShowCloseWarningDialog();
+
+            const auto weak = get_weak();
+            auto warningResult = co_await _ShowConfirmCloseDialog(ConfirmCloseDialogKind::Window);
+            // Hold a strong reference to `this` after the co_await; we may
+            // be the last holder if the window was already being torn down.
+            auto strong = weak.get();
+            if (!strong)
+            {
+                co_return;
+            }
+
             _displayingCloseDialog = false;
 
             if (warningResult != ContentDialogResult::Primary)
@@ -5125,14 +5628,15 @@ namespace winrt::TerminalApp::implementation
     // Arguments:
     // - direction: The direction to move the separator in.
     // Return Value:
-    // - <none>
-    void TerminalPage::_ResizePane(const ResizeDirection& direction)
+    // - whether a pane was resized
+    bool TerminalPage::_ResizePane(const ResizeDirection& direction)
     {
         if (const auto tabImpl{ _GetFocusedTabImpl() })
         {
             _UnZoomIfNeeded();
-            tabImpl->ResizePane(direction);
+            return tabImpl->ResizePane(direction);
         }
+        return false;
     }
 
     // Method Description:
@@ -5307,7 +5811,11 @@ namespace winrt::TerminalApp::implementation
             text = winrt::hstring{ Utils::TrimPaste(text) };
         }
 
-        if (text.empty())
+        // LOAD BEARING: Send an empty bracketed paste even if the clipboard was empty.
+        // Bracketed Paste provides an application a way to know whether the
+        // user pasted, even if there was no applicable content on it. This
+        // behavior is observed in GNOME Terminal, among others.
+        if (!bracketedPaste && text.empty())
         {
             co_return;
         }
@@ -5416,18 +5924,42 @@ namespace winrt::TerminalApp::implementation
     }
     CATCH_LOG();
 
-    void TerminalPage::_OpenHyperlinkHandler(const IInspectable /*sender*/, const Microsoft::Terminal::Control::OpenHyperlinkEventArgs eventArgs)
+    safe_void_coroutine TerminalPage::_OpenHyperlinkHandler(const IInspectable /*sender*/, const Microsoft::Terminal::Control::OpenHyperlinkEventArgs eventArgs)
     {
         try
         {
-            auto parsed = winrt::Windows::Foundation::Uri(eventArgs.Uri());
+            auto uriString{ eventArgs.Uri() };
+            auto parsed = winrt::Windows::Foundation::Uri(uriString);
             if (_IsUriSupported(parsed))
             {
-                ShellExecute(nullptr, L"open", eventArgs.Uri().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                bool shouldLaunch{ _IsUriConsideredSomewhatSafe(parsed) };
+
+                if (!shouldLaunch)
+                {
+                    if (auto presenter{ _dialogPresenter.get() })
+                    {
+                        // FindName needs to be called first to actually load the xaml object
+                        auto unopenedUriDialog = FindName(L"UriErrorDialog").try_as<WUX::Controls::ContentDialog>();
+
+                        // Insert the reason and the URI
+                        unopenedUriDialog.SecondaryButtonText(RS_(L"UnsafeUrlConfirmAllowAction"));
+                        CouldNotOpenUriReason().Text(RS_(L"UnsafeUrlConfirmText"));
+                        UnopenedUri().Text(uriString);
+
+                        // Show the dialog
+                        auto result = co_await presenter.ShowDialog(unopenedUriDialog);
+                        shouldLaunch = result == ContentDialogResult::Secondary;
+                    }
+                }
+
+                if (shouldLaunch)
+                {
+                    ShellExecuteW(nullptr, L"open", uriString.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                }
             }
             else
             {
-                _ShowCouldNotOpenDialog(RS_(L"UnsupportedSchemeText"), eventArgs.Uri());
+                _ShowCouldNotOpenDialog(RS_(L"UnsupportedSchemeText"), uriString);
             }
         }
         catch (...)
@@ -5447,9 +5979,10 @@ namespace winrt::TerminalApp::implementation
         if (auto presenter{ _dialogPresenter.get() })
         {
             // FindName needs to be called first to actually load the xaml object
-            auto unopenedUriDialog = FindName(L"CouldNotOpenUriDialog").try_as<WUX::Controls::ContentDialog>();
+            auto unopenedUriDialog = FindName(L"UriErrorDialog").try_as<WUX::Controls::ContentDialog>();
 
             // Insert the reason and the URI
+            unopenedUriDialog.SecondaryButtonText({});
             CouldNotOpenUriReason().Text(reason);
             UnopenedUri().Text(uri);
 
@@ -5500,6 +6033,30 @@ namespace winrt::TerminalApp::implementation
         // clicking on those sorts of links.
         // See discussion in GH#7562 for more details.
         return true;
+    }
+
+    bool TerminalPage::_IsUriConsideredSomewhatSafe(const winrt::Windows::Foundation::Uri& parsedUri)
+    {
+        if (parsedUri.SchemeName() == L"http" || parsedUri.SchemeName() == L"https")
+        {
+            return true;
+        }
+        if (parsedUri.SchemeName() == L"file")
+        {
+            static const auto pathext{ wil::TryGetEnvironmentVariableW<std::wstring>(L"PATHEXT") };
+            const auto filename = parsedUri.Path();
+            for (const auto& e : til::split_iterator{ std::wstring_view{ pathext }, L';' })
+            {
+                if (til::ends_with_insensitive_ascii(filename, e))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return false;
     }
 
     // Important! Don't take this eventArgs by reference, we need to extend the
@@ -5889,8 +6446,7 @@ namespace winrt::TerminalApp::implementation
                 profile = GetClosestProfileForDuplicationOfProfile(profile);
                 controlSettings = Settings::TerminalSettings::CreateWithProfile(_settings, profile);
                 const auto workingDirectory = tabImpl->GetActiveTerminalControl().WorkingDirectory();
-                const auto validWorkingDirectory = !workingDirectory.empty();
-                if (validWorkingDirectory)
+                if (Utils::IsValidDirectory(workingDirectory.c_str()))
                 {
                     controlSettings.DefaultSettings()->StartingDirectory(workingDirectory);
                 }
@@ -6081,7 +6637,13 @@ namespace winrt::TerminalApp::implementation
         // for nulls
         if (const auto& connection{ _duplicateConnectionForRestart(paneContent) })
         {
-            paneContent.GetTermControl().Connection(connection);
+            // Reset the terminal's VT state before attaching the new connection.
+            // The previous client may have left dirty modes (e.g., bracketed
+            // paste, mouse tracking, alternate buffer, kitty keyboard) that
+            // would corrupt input/output for the new shell process.
+            const auto& termControl = paneContent.GetTermControl();
+            termControl.HardResetWithoutErase();
+            termControl.Connection(connection);
             connection.Start();
         }
     }
@@ -7022,7 +7584,7 @@ namespace winrt::TerminalApp::implementation
 
     // Function Description:
     // - Helper to launch a new WT instance elevated. It'll do this by spawning
-    //   a helper process, who will asking the shell to elevate the process for
+    //   a helper process, that will ask the shell to elevate the process for
     //   us. This might cause a UAC prompt. The elevation is performed on a
     //   background thread, as to not block the UI thread.
     // Arguments:
@@ -7724,28 +8286,34 @@ namespace winrt::TerminalApp::implementation
 
         makeItem(RS_(L"DuplicateTabText"), L"\xF5ED", ActionAndArgs{ ShortcutAction::DuplicateTab, nullptr }, menu);
 
-        const auto focusedProfileName = focusedProfile.Name();
-        const auto focusedProfileIcon = focusedProfile.Icon().Resolved();
-        const auto splitPaneDuplicateText = RS_(L"SplitPaneDuplicateText") + L" " + focusedProfileName; // SplitPaneDuplicateText
-
         const auto splitPaneRightText = RS_(L"SplitPaneRightText");
         const auto splitPaneDownText = RS_(L"SplitPaneDownText");
         const auto splitPaneUpText = RS_(L"SplitPaneUpText");
         const auto splitPaneLeftText = RS_(L"SplitPaneLeftText");
         const auto splitPaneToolTipText = RS_(L"SplitPaneToolTipText");
 
-        MUX::Controls::CommandBarFlyout splitPaneContextMenu{};
-        makeItem(splitPaneRightText, focusedProfileIcon, ActionAndArgs{ ShortcutAction::SplitPane, SplitPaneArgs{ SplitType::Duplicate, SplitDirection::Right, .5, nullptr } }, splitPaneContextMenu);
-        makeItem(splitPaneDownText, focusedProfileIcon, ActionAndArgs{ ShortcutAction::SplitPane, SplitPaneArgs{ SplitType::Duplicate, SplitDirection::Down, .5, nullptr } }, splitPaneContextMenu);
-        makeItem(splitPaneUpText, focusedProfileIcon, ActionAndArgs{ ShortcutAction::SplitPane, SplitPaneArgs{ SplitType::Duplicate, SplitDirection::Up, .5, nullptr } }, splitPaneContextMenu);
-        makeItem(splitPaneLeftText, focusedProfileIcon, ActionAndArgs{ ShortcutAction::SplitPane, SplitPaneArgs{ SplitType::Duplicate, SplitDirection::Left, .5, nullptr } }, splitPaneContextMenu);
+        // GetFocusedProfile can return null if no child of the focused tab
+        // was the last control to be focused (e.g. transient focus states).
+        // Skip the "duplicate current pane" entries when that happens —
+        // calling .Name()/.Icon() on a null IProfile crashes with AV in
+        // consume_*<IProfile>::Icon().
+        if (focusedProfile)
+        {
+            const auto focusedProfileName = focusedProfile.Name();
+            const auto focusedProfileIcon = focusedProfile.Icon().Resolved();
+            const auto splitPaneDuplicateText = RS_(L"SplitPaneDuplicateText") + L" " + focusedProfileName; // SplitPaneDuplicateText
 
-        makeContextItem(splitPaneDuplicateText, focusedProfileIcon, splitPaneToolTipText, ActionAndArgs{ ShortcutAction::SplitPane, SplitPaneArgs{ SplitType::Duplicate, SplitDirection::Automatic, .5, nullptr } }, splitPaneContextMenu, splitPaneMenu);
+            MUX::Controls::CommandBarFlyout splitPaneContextMenu{};
+            makeItem(splitPaneRightText, focusedProfileIcon, ActionAndArgs{ ShortcutAction::SplitPane, SplitPaneArgs{ SplitType::Duplicate, SplitDirection::Right, .5, nullptr } }, splitPaneContextMenu);
+            makeItem(splitPaneDownText, focusedProfileIcon, ActionAndArgs{ ShortcutAction::SplitPane, SplitPaneArgs{ SplitType::Duplicate, SplitDirection::Down, .5, nullptr } }, splitPaneContextMenu);
+            makeItem(splitPaneUpText, focusedProfileIcon, ActionAndArgs{ ShortcutAction::SplitPane, SplitPaneArgs{ SplitType::Duplicate, SplitDirection::Up, .5, nullptr } }, splitPaneContextMenu);
+            makeItem(splitPaneLeftText, focusedProfileIcon, ActionAndArgs{ ShortcutAction::SplitPane, SplitPaneArgs{ SplitType::Duplicate, SplitDirection::Left, .5, nullptr } }, splitPaneContextMenu);
 
-        // add menu separator
-        const auto separatorAutoItem = AppBarSeparator{};
+            makeContextItem(splitPaneDuplicateText, focusedProfileIcon, splitPaneToolTipText, ActionAndArgs{ ShortcutAction::SplitPane, SplitPaneArgs{ SplitType::Duplicate, SplitDirection::Automatic, .5, nullptr } }, splitPaneContextMenu, splitPaneMenu);
 
-        splitPaneMenu.SecondaryCommands().Append(separatorAutoItem);
+            // Separator between the "duplicate current" group and the per-profile list.
+            splitPaneMenu.SecondaryCommands().Append(AppBarSeparator{});
+        }
 
         for (auto profileIndex = 0; profileIndex < activeProfileCount; profileIndex++)
         {

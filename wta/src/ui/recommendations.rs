@@ -1,146 +1,222 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::App;
-use crate::coordinator::{OpenTarget, RecommendedAction};
+use crate::app::{rec_card_height, App};
+use crate::coordinator::{OpenTarget, RecommendationChoice, RecommendedAction};
 use crate::theme;
 
+/// Render the recommendations panel. Pure: callers (layout.rs) must call
+/// `App::sync_rec_scroll_max` first so `rec_scroll.offset` is already clamped
+/// when we paint.
+///
+/// Cards are positioned in a virtual canvas (stacked top-to-bottom by their
+/// natural heights), then shifted up by `rec_scroll`. The navigation hint is
+/// rendered separately by `render_hint` so it can sit directly above the
+/// input box (see `layout.rs`).
+///
+/// Cards taller than the remaining cards region render **truncated** at the
+/// height that fits — `render_card` lets cassowary squash the inner content
+/// area, so the user keeps the border, button, and as many content rows as
+/// fit. This avoids the previous "tall card in squashed pane → nothing
+/// renders" failure mode.
 pub fn render(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(recommendations) = &app.current_tab().recommendations else {
+    let Some(recs) = app.current_tab().turn.recommendations() else { return };
+    if area.width == 0 || area.height == 0 {
         return;
+    }
+
+    let rec_scroll = app.current_tab().rec_scroll.offset;
+    let cards_bottom = area.y.saturating_add(area.height);
+
+    let mut canvas_top = 0usize;
+    for (idx, choice) in recs.choices.iter().enumerate() {
+        let h = rec_card_height(choice, area.width);
+        if canvas_top >= rec_scroll {
+            let card_h = h.saturating_sub(1) as u16; // last canvas row is inter-card gap
+            let y = area.y + (canvas_top - rec_scroll) as u16;
+            let available = cards_bottom.saturating_sub(y);
+            if available < 4 {
+                break; // render_card bails below 4 — nothing useful to draw
+            }
+            let render_h = card_h.min(available);
+            // Cards use the full h_rec[1] width so their left border sits in
+            // the same column as the chat's green dot (column 1 of main_area)
+            // and the right border is symmetric on the opposite edge.
+            let card_area = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: render_h,
+            };
+            render_card(frame, app, card_area, choice, idx);
+        }
+        canvas_top += h;
+    }
+}
+
+/// Render the recommendations navigation hint. Called by `layout.rs` to
+/// place this row directly above the input box, regardless of how tall the
+/// rec panel is.
+pub fn render_hint(frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let hint = Paragraph::new(Line::from(Span::styled(
+        "(↑ ↓ to navigate • Enter to select • Esc to cancel)",
+        theme::DIM,
+    )));
+    frame.render_widget(hint, area);
+}
+
+fn render_card(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    choice: &RecommendationChoice,
+    idx: usize,
+) {
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+
+    // The key handlers already gate Up/Down/Left/Right/Tab/Enter on
+    // `input.is_empty()` — i.e. you can navigate cards only when no text is
+    // in the prompt box. Mirror that here so the focus highlight matches:
+    // typing should visibly take focus away from the cards, otherwise the
+    // user sees "two focuses" and can't tell whether Enter will activate
+    // the card or submit the prompt.
+    let nav_mode = app.current_tab().input.is_empty();
+    let is_selected = nav_mode && idx == app.current_tab().selected_recommendation;
+    let border_style = if is_selected {
+        theme::CARD_BORDER_SELECTED
+    } else {
+        theme::CARD_BORDER
     };
 
-    let mut lines: Vec<Line> = Vec::new();
-    let single_choice = recommendations.choices.len() == 1;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    for (idx, choice) in recommendations.choices.iter().enumerate() {
-        let is_selected = idx == app.current_tab().selected_recommendation;
-        let is_recommended = recommendations.recommended_choice == Some(choice.choice);
+    if inner.height < 3 || inner.width == 0 {
+        return;
+    }
 
-        // Skip the numbered title row when there is only one choice — the
-        // agent's intro text in the chat already conveys what the action is,
-        // and the Figma design omits this header for single-choice cards.
-        if !single_choice {
-            let title_style = if is_selected {
-                theme::RECOMMENDATION_TITLE
-            } else {
-                theme::RECOMMENDATION_DETAIL
-            };
-            let mut title_spans: Vec<Span> = Vec::new();
-            if is_recommended {
-                title_spans.push(Span::styled("● ", theme::DOT_AGENT));
-            } else {
-                title_spans.push(Span::raw("  "));
-            }
-            title_spans.push(Span::styled(
-                format!("{}. {}", choice.choice, choice.title),
-                title_style,
-            ));
-            lines.push(Line::from(title_spans));
-        }
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let content_area = inner_chunks[0];
+    let divider_y = inner_chunks[1].y;
+    let button_area = inner_chunks[2];
 
-        // Determine card content based on action type
-        let (command_text, buttons, body_kind) = extract_card_content(choice, app, is_selected);
-        let body_style = match body_kind {
-            CardBodyKind::Code => theme::CARD_CODE,
-            CardBodyKind::Description => theme::CARD_DESCRIPTION,
-        };
-        let divider_style = if is_selected {
-            theme::CARD_BORDER_SELECTED
-        } else {
-            theme::CARD_BORDER
-        };
+    let (command_text, buttons, body_kind) = extract_card_content(choice, app, is_selected);
+    let body_style = match body_kind {
+        CardBodyKind::Code => theme::CARD_CODE,
+        CardBodyKind::Description => theme::CARD_DESCRIPTION,
+    };
+    let content_inner = inset_horizontal(content_area, 2);
+    if content_inner.width > 0 {
+        let content = Paragraph::new(command_text)
+            .style(body_style)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(content, content_inner);
+    }
 
-        // Card width = full available width minus a 2-col indent on each side.
-        // No outer border — the card is just a filled rectangle (CARD_BG)
-        // with a single horizontal divider between command and buttons.
-        let card_width = area.width.saturating_sub(4) as usize;
-        // Inner content area = card minus 2 chars of left/right padding inside
-        // the fill so text/buttons have breathing room from the card edge.
-        let content_width = card_width.saturating_sub(4);
+    render_divider(frame.buffer_mut(), area, divider_y, border_style);
 
-        // Helper to push an empty CARD_BG row that fills the full card width,
-        // used for vertical padding so glyphs aren't flush with card edges.
-        let push_pad_row = |lines: &mut Vec<Line>| {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(" ".repeat(card_width), theme::CARD_FILL),
-            ]));
-        };
-
-        // Top padding inside the card.
-        push_pad_row(&mut lines);
-
-        // Command/content lines — full card_width painted with CARD_BG.
-        for cmd_line in wrap_text(&command_text, content_width) {
-            let padded = format!("  {}  ", pad_right(&cmd_line, content_width));
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(padded, body_style),
-            ]));
-        }
-
-        // Divider line — `─` glyphs across the full card width, painted on
-        // CARD_BG so it reads as a hairline inside the card.
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("─".repeat(card_width), divider_style),
-        ]));
-
-        // Button row — same card_width fill, buttons right-aligned.
-        let button_spans = build_button_spans(
+    let button_inner = inset_horizontal(button_area, 2);
+    if button_inner.width > 0 {
+        render_buttons(
+            frame,
+            button_inner,
             &buttons,
             is_selected,
             app.current_tab().selected_button,
-            card_width,
         );
-        lines.push(Line::from(button_spans));
-
-        // Bottom padding inside the card.
-        push_pad_row(&mut lines);
-
-        // Spacing between cards
-        lines.push(Line::default());
     }
-
-    // Hint line
-    lines.push(Line::from(Span::styled(
-        "Enter: activate | Esc: dismiss",
-        theme::DIM,
-    )));
-
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::NONE).padding(Padding::zero()))
-        .wrap(Wrap { trim: false })
-        .scroll((app.current_tab().rec_scroll as u16, 0));
-    frame.render_widget(paragraph, area);
 }
 
-/// Visual style hint for the card body.
-///
-/// `Code` renders the body as the literal command/input that will be executed
-/// (sharp, monospace-feeling). `Description` renders dimmed italic prose for
-/// actions that don't have a literal command to show — e.g. `Open`, where the
-/// body is metadata about the new destination, not something the user is about
-/// to type.
+fn inset_horizontal(r: Rect, n: u16) -> Rect {
+    Rect {
+        x: r.x.saturating_add(n),
+        y: r.y,
+        width: r.width.saturating_sub(n.saturating_mul(2)),
+        height: r.height,
+    }
+}
+
+fn render_divider(buf: &mut Buffer, area: Rect, y: u16, border_style: Style) {
+    if y < area.y || y >= area.y.saturating_add(area.height) {
+        return;
+    }
+    if area.width < 2 {
+        return;
+    }
+    let left = area.x;
+    let right = area.x.saturating_add(area.width).saturating_sub(1);
+    if left >= right {
+        return;
+    }
+    buf.set_string(left, y, "├", border_style);
+    let middle_width = area.width.saturating_sub(2) as usize;
+    if middle_width > 0 {
+        buf.set_string(left.saturating_add(1), y, "─".repeat(middle_width), border_style);
+    }
+    buf.set_string(right, y, "┤", border_style);
+}
+
+fn render_buttons(
+    frame: &mut Frame,
+    area: Rect,
+    buttons: &[String],
+    is_selected: bool,
+    focused_button: usize,
+) {
+    let mut pieces: Vec<(String, Style)> = Vec::new();
+    for (i, label) in buttons.iter().enumerate() {
+        if i > 0 {
+            pieces.push(("   ".into(), Style::default()));
+        }
+        let style = if is_selected && i == focused_button {
+            theme::BUTTON_FOCUSED
+        } else {
+            theme::BUTTON_PLAIN
+        };
+        pieces.push((label.clone(), style));
+    }
+
+    // Left-align buttons so they sit under the command text column.
+    let mut spans: Vec<Span> = Vec::with_capacity(pieces.len());
+    for (text, style) in pieces {
+        spans.push(Span::styled(text, style));
+    }
+
+    let para = Paragraph::new(Line::from(spans));
+    frame.render_widget(para, area);
+}
+
 enum CardBodyKind {
     Code,
     Description,
 }
 
-/// Extracts the display text, button labels, and body style from a choice's actions.
 fn extract_card_content(
-    choice: &crate::coordinator::RecommendationChoice,
+    choice: &RecommendationChoice,
     _app: &App,
     _is_selected: bool,
 ) -> (String, Vec<String>, CardBodyKind) {
-    // Find the primary action
     for action in &choice.actions {
         match action {
             RecommendedAction::Send { input, .. } => {
                 return (
                     input.clone(),
-                    vec!["[ Run ]".into(), "Insert in Terminal".into()],
+                    vec!["[ Run command ]".into(), "Insert in Terminal".into()],
                     CardBodyKind::Code,
                 );
             }
@@ -189,95 +265,9 @@ fn extract_card_content(
         }
     }
 
-    // Fallback: just show the title
     (
         choice.title.clone(),
         vec!["Execute ↵".into()],
         CardBodyKind::Description,
     )
-}
-
-/// Builds styled spans for the button row inside a card.
-///
-/// The whole `card_width` is painted with `CARD_FILL` so the row reads as
-/// part of the same filled card. Buttons are right-aligned; each button is
-/// padded with one space on either side so that its own bg paints a
-/// button-shaped pill within the card fill.
-fn build_button_spans<'a>(
-    buttons: &[String],
-    is_selected: bool,
-    focused_button: usize,
-    card_width: usize,
-) -> Vec<Span<'a>> {
-    let mut spans = Vec::new();
-    spans.push(Span::raw("  "));
-
-    let mut button_pieces: Vec<(String, Style)> = Vec::new();
-    for (i, label) in buttons.iter().enumerate() {
-        if i > 0 {
-            // Wider gap between buttons (~Figma's gap-[24px]) takes the card
-            // fill, not the button bg.
-            button_pieces.push(("   ".into(), theme::CARD_FILL));
-        }
-        // Focused button: tight white pill (label rendered as-is, no extra
-        // padding — `[ Run ]` already carries its own brackets).
-        // Non-focused button: plain white text, no pill — matches Figma's
-        // secondary-action look.
-        let style = if is_selected && i == focused_button {
-            theme::BUTTON_FOCUSED
-        } else {
-            theme::BUTTON_PLAIN
-        };
-        button_pieces.push((label.clone(), style));
-    }
-
-    let buttons_width: usize = button_pieces.iter().map(|(t, _)| t.chars().count()).sum();
-    // Right-align with two cells of right padding before the card edge,
-    // matching the 2-cell horizontal inset used by command lines.
-    let right_pad = 2usize.min(card_width.saturating_sub(buttons_width));
-    let pad_left = card_width.saturating_sub(buttons_width + right_pad);
-    spans.push(Span::styled(" ".repeat(pad_left), theme::CARD_FILL));
-
-    for (text, style) in button_pieces {
-        spans.push(Span::styled(text, style));
-    }
-
-    let used: usize = pad_left + buttons_width;
-    if used < card_width {
-        spans.push(Span::styled(" ".repeat(card_width - used), theme::CARD_FILL));
-    }
-
-    spans
-}
-
-/// Simple text wrapping.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut lines = Vec::new();
-    for raw_line in text.lines() {
-        if raw_line.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-        let chars: Vec<char> = raw_line.chars().collect();
-        for chunk in chars.chunks(width) {
-            lines.push(chunk.iter().collect());
-        }
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-/// Pads a string with spaces to the right to reach the target width.
-fn pad_right(s: &str, width: usize) -> String {
-    let len = s.chars().count();
-    if len >= width {
-        s.to_string()
-    } else {
-        format!("{}{}", s, " ".repeat(width - len))
-    }
 }

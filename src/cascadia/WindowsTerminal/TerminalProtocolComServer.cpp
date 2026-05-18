@@ -684,6 +684,25 @@ void TerminalProtocolComServer::SendEvent(winrt::hstring const& eventJson)
         return;
     }
 
+    // close_agent_pane: user pressed Ctrl+C twice in the wta TUI. Marshal to
+    // the UI thread and tell TerminalPage to tear down the shared agent pane.
+    if (evt.isMember("method") && evt["method"].isString() &&
+        evt["method"].asString() == "close_agent_pane")
+    {
+        _dispatchCloseAgentPaneToPage(eventJson);
+        return;
+    }
+
+    // view_changed: wta TUI flipped its internal view (Esc out of Agents, or
+    // `/sessions` slash command). C++ mirrors the new view onto the agent bar
+    // title + the bottom bar's sessions/chat highlight.
+    if (evt.isMember("method") && evt["method"].isString() &&
+        evt["method"].asString() == "view_changed")
+    {
+        _dispatchViewChangedToPage(eventJson);
+        return;
+    }
+
     // Legacy path: params.event is required for agent_event broadcasts.
     THROW_HR_IF(E_INVALIDARG, !evt.isMember("params") || !evt["params"].isMember("event"));
 
@@ -761,6 +780,78 @@ void TerminalProtocolComServer::_dispatchAgentStatusToPage(const winrt::hstring&
                 try
                 {
                     page.OnAgentStatusChanged(eventJson);
+                }
+                catch (...)
+                {
+                    // Swallow: page may have been torn down during dispatch.
+                }
+            });
+    }
+}
+
+void TerminalProtocolComServer::_dispatchCloseAgentPaneToPage(const winrt::hstring& eventJson)
+{
+    if (!s_emperor)
+    {
+        return;
+    }
+    // Fan out to every window; the wta that emitted this event lives in one of
+    // them and only that window's TerminalPage has the matching _agentPane.
+    // Pages with no agent pane no-op the call (see OnCloseAgentPaneRequested).
+    for (const auto& host : s_emperor->GetWindows())
+    {
+        auto page = _getPage(host.get());
+        if (!page)
+        {
+            continue;
+        }
+        const auto dispatcher = page.Dispatcher();
+        if (!dispatcher)
+        {
+            continue;
+        }
+        dispatcher.RunAsync(
+            winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+            [page, eventJson]() {
+                try
+                {
+                    page.OnCloseAgentPaneRequested(eventJson);
+                }
+                catch (...)
+                {
+                    // Swallow: page may have been torn down during dispatch.
+                }
+            });
+    }
+}
+
+void TerminalProtocolComServer::_dispatchViewChangedToPage(const winrt::hstring& eventJson)
+{
+    if (!s_emperor)
+    {
+        return;
+    }
+    // Same fan-out shape as the other dispatchers: the agent pane lives in
+    // exactly one window, but we don't know which from here, and pages with
+    // no agent pane no-op the call (see OnAgentViewChanged).
+    for (const auto& host : s_emperor->GetWindows())
+    {
+        auto page = _getPage(host.get());
+        if (!page)
+        {
+            continue;
+        }
+        const auto dispatcher = page.Dispatcher();
+        if (!dispatcher)
+        {
+            continue;
+        }
+        dispatcher.RunAsync(
+            winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+            [page, eventJson]() {
+                try
+                {
+                    page.OnAgentViewChanged(eventJson);
                 }
                 catch (...)
                 {

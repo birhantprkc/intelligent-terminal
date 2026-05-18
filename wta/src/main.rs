@@ -79,6 +79,22 @@ struct Cli {
     #[arg(long)]
     setup: Option<String>,
 
+    /// Initial TUI view to show on startup. `chat` (default) starts in the
+    /// chat view; `sessions` starts in the Agents (session list) view —
+    /// equivalent to the user pressing F2 right after the pane opens.
+    /// Wired to WT's Ctrl+Shift+/ binding via TerminalPage.
+    #[arg(long, value_enum, default_value_t = InitialView::Chat)]
+    initial_view: InitialView,
+
+    /// Stable GUID of the WT tab that owns this wta process. Passed in by
+    /// TerminalPage when spawning the agent pane (both _OpenOrReuseAgentPane
+    /// and _AutoCreateHiddenAgentPane). Seeded into app_state.tab_id before
+    /// ACP init, so the first AgentConnected binds the session under the
+    /// real tab GUID instead of falling back to the implicit DEFAULT_TAB_ID
+    /// placeholder. Hidden because nothing outside WT should be setting it.
+    #[arg(long, hide = true)]
+    owner_tab_id: Option<String>,
+
     // Legacy flags (hidden, backward compat)
     #[arg(long, hide = true)]
     info: bool,
@@ -261,6 +277,22 @@ enum Command {
         #[command(subcommand)]
         action: HooksAction,
     },
+
+    /// One-shot ACP handshake to read an agent's advertised model list.
+    /// Spawned by the Settings UI when the user picks a new ACP agent so
+    /// the model dropdown can populate before any real agent pane is
+    /// rebuilt. Prints a single JSON object to stdout:
+    ///
+    ///   {"available_models":[{"id":"...","name":"...","description":"..."}],
+    ///    "current_model_id":"..."}
+    ///
+    /// On error: non-zero exit, message on stderr.
+    ProbeModels {
+        /// Full agent cmdline, same shape as `--agent` (e.g.
+        /// "copilot --acp --stdio" or "npx -y @zed-industries/claude-code-acp").
+        #[arg(long)]
+        agent: String,
+    },
 }
 
 /// Subcommands for `wta hooks`.
@@ -307,6 +339,14 @@ impl HooksCliFilter {
             HooksCliFilter::Gemini => CliScope::One(CliKind::Gemini),
         }
     }
+}
+
+/// `--initial-view` selector. Drives whether the TUI starts in the chat
+/// view (default) or jumps straight to the Agents (session list) view.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum InitialView {
+    Chat,
+    Sessions,
 }
 
 // ─── Entry Point ────────────────────────────────────────────────────────────
@@ -540,9 +580,57 @@ async fn main() -> Result<()> {
             HooksAction::Uninstall { cli } => run_hooks_uninstall(cli, json_mode),
         },
 
+        // ── ACP model list probe ──
+        Some(Command::ProbeModels { agent }) => run_probe_models(&agent).await,
+
         // ── No subcommand = ACP TUI mode (default) ──
         None => run_default_tui(cli).await,
     }
+}
+
+/// Drive [`protocol::acp::probe::probe_models`] on a tokio `LocalSet`
+/// (the ACP client connection is `!Send`), serialize the result to
+/// stdout, force-exit. See exit notes below.
+async fn run_probe_models(agent: &str) -> Result<()> {
+    // Logging must go to file, not stderr — the Settings UI captures
+    // our stdout for the JSON payload, and stderr would be folded
+    // into the same pipe and pollute the parser.
+    let _guard = logging::init("probe");
+    tracing::info!("probe-models start: agent={}", agent);
+
+    let local = tokio::task::LocalSet::new();
+    let result = match local
+        .run_until(protocol::acp::probe::probe_models(agent))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("probe-models failed: {:#}", e);
+            eprintln!("probe-models failed: {:#}", e);
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            // See exit rationale below.
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        "probe-models ok: {} model(s), current={:?}",
+        result.available_models.len(),
+        result.current_model_id
+    );
+    let payload = serde_json::to_string(&result)
+        .context("serialize probe result")?;
+    println!("{}", payload);
+
+    // Force-exit before the tokio runtime tries to drop. The agent we
+    // spawned is e.g. `cmd /c npx ...`; kill_on_drop kills cmd but
+    // the npx → node grandchildren survive as orphans. Tokio's IOCP
+    // reactor stays blocked on handles those orphans inherited and
+    // the runtime drop hangs for ~35s. Runtime cleanup is meaningless
+    // for a one-shot CLI — the caller is blocked on our process
+    // handle, exit now. Orphan grandchildren self-exit shortly after
+    // when they notice their pipes are broken.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::process::exit(0);
 }
 
 // ─── Hooks subcommand handlers ──────────────────────────────────────────────
@@ -1463,6 +1551,12 @@ async fn run_acp_app(
             // kills the agent child process, drops the connection, and
             // respawns from scratch. State is cleaned up on both sides.
             let (restart_tx, restart_rx) = tokio::sync::mpsc::unbounded_channel();
+            // reset_tab_session channel: App emits a DropSessionRequest when
+            // WT tells us to release a tab's binding (Ctrl+C×2 hide path).
+            // ACP client removes the SessionId from tab_to_session and
+            // cancels any in-flight prompt for it; the next prompt on that
+            // tab lazily creates a fresh session.
+            let (drop_session_tx, drop_session_rx) = tokio::sync::mpsc::unbounded_channel();
 
             // Spawn the ACP client -- but not in setup mode, where the user
             // hasn't chosen an agent yet. Store params for deferred start.
@@ -1470,17 +1564,19 @@ async fn run_acp_app(
                 tokio::task::spawn_local(protocol::acp::client::run_acp_client(
                     agent_cmd.clone(),
                     cli.acp_model.clone(),
+                    cli.owner_tab_id.clone(),
                     event_tx.clone(),
                     prompt_rx,
                     cancel_rx,
                     new_session_rx,
+                    drop_session_rx,
                     restart_rx,
                     Arc::clone(&shell_mgr),
                     wt_connected,
                 ));
                 None
             } else {
-                Some((cancel_rx, new_session_rx, restart_rx))
+                Some((prompt_rx, cancel_rx, new_session_rx, drop_session_rx, restart_rx))
             };
 
             let (recommendation_tx, recommendation_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1503,7 +1599,7 @@ async fn run_acp_app(
             ));
 
             let autofix_enabled = !cli.no_autofix;
-            let mut app_state = app::App::new(prompt_tx, recommendation_tx, permission_tx, cancel_tx, new_session_tx, restart_tx, debug_capture_enabled, wt_connected, autofix_enabled);
+            let mut app_state = app::App::new(prompt_tx, recommendation_tx, permission_tx, cancel_tx, new_session_tx, drop_session_tx, restart_tx, debug_capture_enabled, wt_connected, autofix_enabled);
 
             // ── Preflight: check the agent CLI before connecting ──────────
             // Skip preflight when FRE is active — FRE has its own agent
@@ -1566,6 +1662,28 @@ async fn run_acp_app(
             // ResumePaneAssigned) back into the event loop.
             app_state.set_agent_event_tx(event_tx.clone());
 
+            // Apply --initial-view: if `sessions`, jump straight into the
+            // Agents view (mirrors the F2 Chat→Agents toggle). Wired to
+            // WT's Ctrl+Shift+/ binding via `--initial-view sessions` on
+            // the wta cmdline. Must run after set_agent_event_tx so that
+            // ensure_history_loaded()'s event_tx clone is populated —
+            // otherwise the lazy scan would early-return and the Agents
+            // list would never populate.
+            //
+            // Skip in setup mode: --setup takes the FRE path and the user
+            // shouldn't be dropped into an empty session list.
+            if cli.setup.is_none() && cli.initial_view == InitialView::Sessions {
+                tracing::info!(target: "initial_view", "starting in Agents view");
+                app_state.current_tab_mut().current_view = app::View::Agents;
+                // Seed selection so Enter activates the first row immediately
+                // (mirrors the F2 enter-Agents path).
+                let has_sessions = !app_state.agent_sessions.iter_sorted().is_empty();
+                if has_sessions {
+                    app_state.current_tab_mut().agents_list_state.select(Some(0));
+                }
+                app_state.ensure_history_loaded();
+            }
+
             // NOTE: historical agent sessions used to be loaded here via
             // `history_loader::load_all()` (later as a `spawn_blocking`).
             // That work is now deferred — the registry is scanned lazily
@@ -1618,24 +1736,56 @@ async fn run_acp_app(
             app_state.set_event_tx(event_tx.clone());
 
             // If in setup mode, store ACP params for deferred start after login.
-            if let Some((cancel_rx, new_session_rx, restart_rx)) = deferred_channels {
-                let (_deferred_prompt_tx, deferred_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+            if let Some((prompt_rx, cancel_rx, new_session_rx, drop_session_rx, restart_rx)) = deferred_channels {
                 app_state.set_acp_params(
                     agent_cmd.clone(),
                     cli.acp_model.clone(),
-                    deferred_prompt_rx,
+                    prompt_rx,
                     cancel_rx,
                     new_session_rx,
+                    drop_session_rx,
                     restart_rx,
                     Arc::clone(&shell_mgr),
                     wt_connected,
                 );
             }
 
-            if let Some((pane_id, tab_id, window_id)) = pane_identity {
+            if let Some((pane_id, _tab_id, window_id)) = pane_identity {
                 app_state.pane_id = Some(pane_id);
-                app_state.tab_id = Some(tab_id);
+                // discover_pane_identity returns the legacy unstable tab
+                // index, not the GUID — ignore it. The stable owner-tab GUID
+                // is passed by WT via --owner-tab-id (see below) and seeded
+                // directly into app_state.tab_id.
                 app_state.window_id = Some(window_id);
+            }
+
+            // Seed tab_id from --owner-tab-id (passed by TerminalPage when
+            // spawning the agent pane). With this set, AgentConnected binds
+            // the initial session under the correct GUID immediately, and
+            // tab_changed events later are plain switches — no implicit
+            // DEFAULT_TAB_ID placeholder, no migration heuristics. Falls
+            // back to None for non-pane invocations (manual `wta` runs, the
+            // `wta delegate` subcommand), where the legacy DEFAULT_TAB_ID
+            // path handles routing.
+            //
+            // Materialize the matching `tab_sessions` entry alongside the
+            // tab_id assignment — `current_tab()` borrows immutably and
+            // expects the active key to already be present, so without
+            // pre-inserting we'd panic on the first render before any
+            // event has had a chance to lazy-create it.
+            if let Some(owner_tab_id) = cli.owner_tab_id.clone() {
+                if !owner_tab_id.is_empty() {
+                    tracing::info!(
+                        target: "tab_session",
+                        tab_id = %owner_tab_id,
+                        "seeded app_state.tab_id from --owner-tab-id"
+                    );
+                    app_state
+                        .tab_sessions
+                        .entry(owner_tab_id.clone())
+                        .or_default();
+                    app_state.tab_id = Some(owner_tab_id);
+                }
             }
 
             // ── source-pane context (autofix attribution) ─────────────────
