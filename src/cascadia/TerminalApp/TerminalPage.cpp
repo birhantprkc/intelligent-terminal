@@ -1079,7 +1079,10 @@ namespace winrt::TerminalApp::implementation
             cmdline += L" --delegate-model " + quoteArg(std::wstring_view{ delegateModel });
         }
 
-
+        if (const auto lang = globals.Language(); !lang.empty())
+        {
+            cmdline += L" --language " + quoteArg(std::wstring_view{ lang });
+        }
 
         // Pass CWD from the active pane.
         winrt::hstring activeCwd;
@@ -1830,6 +1833,14 @@ namespace winrt::TerminalApp::implementation
             cmdline += L" --no-autofix";
         }
 
+        if (const auto lang = globals.Language(); !lang.empty())
+        {
+            std::wstring langStr{ lang };
+            for (size_t pos = 0; (pos = langStr.find(L'"', pos)) != std::wstring::npos; pos += 2)
+                langStr.replace(pos, 1, L"\"\"");
+            cmdline += fmt::format(FMT_COMPILE(L" --language \"{}\""), langStr);
+        }
+
         _agentPaneLog("_AutoCreateHiddenAgentPane: cmdline=" + winrt::to_string(winrt::hstring{ cmdline }));
 
         winrt::hstring startingDirectory;
@@ -2208,6 +2219,17 @@ namespace winrt::TerminalApp::implementation
             if (!globals.AutoFixEnabled())
             {
                 cmdline += L" --no-autofix";
+            }
+
+            // Pass the user's Language override so the agent pane displays
+            // the same language as the Terminal chrome (aligns with the
+            // PrimaryLanguageOverride set by AppLogic).
+            if (const auto lang = globals.Language(); !lang.empty())
+            {
+                std::wstring langStr{ lang };
+                for (size_t pos = 0; (pos = langStr.find(L'"', pos)) != std::wstring::npos; pos += 2)
+                    langStr.replace(pos, 1, L"\"\"");
+                cmdline += fmt::format(FMT_COMPILE(L" --language \"{}\""), langStr);
             }
 
             if (intoSessionsView)
