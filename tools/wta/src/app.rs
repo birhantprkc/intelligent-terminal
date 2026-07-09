@@ -390,6 +390,9 @@ pub enum ConnectionState {
 pub enum ChatMessage {
     User(String),
     Agent(String),
+    /// App-generated agent-style text that should stay literal (for example
+    /// parsed recommendation summaries containing command strings).
+    AgentLiteral(String),
     System(String),
     ToolCall {
         id: String,
@@ -8866,7 +8869,7 @@ impl App {
         let tab = self.session_tab_mut(session_id);
         let prompt = tab.turn.prompt().cloned().expect("prompt set");
         let mut details = tab.current_turn_details();
-        details.push(ChatMessage::Agent(summary));
+        details.push(ChatMessage::AgentLiteral(summary));
         tab.completed_turns.push(CompletedTurn {
             prompt: prompt.text.clone(),
             details,
@@ -8948,7 +8951,7 @@ impl App {
         let tab = self.session_tab_mut(session_id);
         let prompt = tab.turn.prompt().cloned().expect("prompt set");
         let mut details = tab.current_turn_details();
-        details.push(ChatMessage::Agent(summary));
+        details.push(ChatMessage::AgentLiteral(summary));
         tab.completed_turns.push(CompletedTurn {
             prompt: turn_prompt_label,
             details,
