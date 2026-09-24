@@ -160,10 +160,38 @@ namespace winrt::TerminalApp::implementation
         // [^1]: microsoft-ui-xaml/blob/92fbfcd55f05c92ac65569f5d284c5b36492091e/dev/TabView/TabView.cpp#L751-L758
         TabViewItem().Content(winrt::WUX::Controls::Border{});
 
-        TabViewItem().DoubleTapped([weakThis = get_weak()](auto&& /*s*/, auto&& /*e*/) {
+        TabViewItem().DoubleTapped([weakThis = get_weak()](auto&& /*s*/, const WUX::Input::DoubleTappedRoutedEventArgs& e) {
             if (auto tab{ weakThis.get() })
             {
+                if (tab->_tabPointerInteractionRestricted)
+                {
+                    e.Handled(true);
+                    return;
+                }
                 tab->ActivateTabRenamer();
+            }
+        });
+        TabViewItem().RightTapped([weakThis = get_weak()](auto&& /*s*/, const WUX::Input::RightTappedRoutedEventArgs& e) {
+            if (const auto tab{ weakThis.get() };
+                tab && tab->_tabPointerInteractionRestricted)
+            {
+                e.Handled(true);
+            }
+        });
+        TabViewItem().ContextRequested([weakThis = get_weak()](auto&& /*s*/, const WUX::Input::ContextRequestedEventArgs& e) {
+            if (const auto tab{ weakThis.get() };
+                tab && tab->_tabPointerInteractionRestricted)
+            {
+                Windows::Foundation::Point pointerPosition;
+                if (e.TryGetPosition(tab->TabViewItem(), pointerPosition))
+                {
+                    e.Handled(true);
+                }
+                else if (tab->_contextMenuFlyout)
+                {
+                    tab->_contextMenuFlyout.ShowAt(tab->TabViewItem());
+                    e.Handled(true);
+                }
             }
         });
 
@@ -1117,8 +1145,13 @@ namespace winrt::TerminalApp::implementation
     {
         ASSERT_UI_THREAD();
 
+        const auto previousTitle = Title();
         _runtimeTabText = title;
         UpdateTitle();
+        if (Title() == previousTitle)
+        {
+            PropertyChanged.raise(*this, WUX::Data::PropertyChangedEventArgs{ L"Title" });
+        }
     }
 
     winrt::hstring Tab::GetTabText() const
@@ -1132,8 +1165,13 @@ namespace winrt::TerminalApp::implementation
     {
         ASSERT_UI_THREAD();
 
+        const auto previousTitle = Title();
         _runtimeTabText = L"";
         UpdateTitle();
+        if (Title() == previousTitle)
+        {
+            PropertyChanged.raise(*this, WUX::Data::PropertyChangedEventArgs{ L"Title" });
+        }
     }
 
     // Method Description:
@@ -1148,6 +1186,12 @@ namespace winrt::TerminalApp::implementation
         ASSERT_UI_THREAD();
 
         _headerControl.BeginRename();
+    }
+
+    void Tab::CancelTabRename()
+    {
+        ASSERT_UI_THREAD();
+        _headerControl.CancelRename();
     }
 
     // Method Description:
@@ -1899,6 +1943,22 @@ namespace winrt::TerminalApp::implementation
         return closeSubMenu;
     }
 
+    void Tab::SetVerticalTabLayout(const bool vertical)
+    {
+        const auto label = vertical ? RS_(L"TabCloseBelow") : RS_(L"TabCloseAfter");
+        const auto tooltip = vertical ? RS_(L"TabCloseBelowToolTip") : RS_(L"TabCloseAfterToolTip");
+        _closeTabsAfterMenuItem.Text(label);
+        WUX::Controls::ToolTipService::SetToolTip(_closeTabsAfterMenuItem, box_value(tooltip));
+        Automation::AutomationProperties::SetHelpText(_closeTabsAfterMenuItem, tooltip);
+
+        _switchTabLayoutTarget = vertical ? TabLayout::Horizontal : TabLayout::Vertical;
+        const auto switchLabel = vertical ? RS_(L"SwitchToHorizontalTabsText") : RS_(L"SwitchToVerticalTabsText");
+        const auto switchTooltip = vertical ? RS_(L"SwitchToHorizontalTabsToolTip") : RS_(L"SwitchToVerticalTabsToolTip");
+        _switchTabLayoutMenuItem.Text(switchLabel);
+        WUX::Controls::ToolTipService::SetToolTip(_switchTabLayoutMenuItem, box_value(switchTooltip));
+        Automation::AutomationProperties::SetHelpText(_switchTabLayoutMenuItem, switchTooltip);
+    }
+
     // Method Description:
     // - Creates a context menu attached to the tab.
     // Currently contains elements allowing to select or
@@ -2041,6 +2101,15 @@ namespace winrt::TerminalApp::implementation
             Automation::AutomationProperties::SetHelpText(_restartConnectionMenuItem, restartConnectionToolTip);
         }
 
+        {
+            _switchTabLayoutMenuItem.Click([weakThis](auto&&, auto&&) {
+                if (const auto tab{ weakThis.get() })
+                {
+                    tab->_pendingTabLayoutChange = tab->_switchTabLayoutTarget;
+                }
+            });
+        }
+
         // Build the menu
         Controls::MenuFlyout contextMenuFlyout;
         Controls::MenuFlyoutSeparator menuSeparator;
@@ -2052,6 +2121,7 @@ namespace winrt::TerminalApp::implementation
         contextMenuFlyout.Items().Append(_exportTabMenuItem);
         contextMenuFlyout.Items().Append(_findMenuItem);
         contextMenuFlyout.Items().Append(_restartConnectionMenuItem);
+        contextMenuFlyout.Items().Append(_switchTabLayoutMenuItem);
         contextMenuFlyout.Items().Append(menuSeparator);
 
         auto closeSubMenu = _AppendCloseMenuItems(contextMenuFlyout);
@@ -2074,10 +2144,45 @@ namespace winrt::TerminalApp::implementation
                 {
                     tab->RequestFocusActiveControl.raise();
                 }
+
+                if (const auto target = std::exchange(tab->_pendingTabLayoutChange, std::nullopt))
+                {
+                    tab->TabViewItem().Dispatcher().RunAsync(CoreDispatcherPriority::Low, [weakThis, target = *target]() {
+                        if (const auto deferredTab{ weakThis.get() })
+                        {
+                            deferredTab->TabLayoutChangeRequested.raise(*deferredTab, target);
+                        }
+                    });
+                }
             }
         });
 
-        TabViewItem().ContextFlyout(contextMenuFlyout);
+        _contextMenuFlyout = contextMenuFlyout;
+        TabViewItem().ContextFlyout(_contextMenuFlyout);
+    }
+
+    void Tab::SetTabPointerInteractionRestricted(const bool restricted)
+    {
+        ASSERT_UI_THREAD();
+
+        if (_tabPointerInteractionRestricted == restricted)
+        {
+            return;
+        }
+
+        _tabPointerInteractionRestricted = restricted;
+        if (restricted)
+        {
+            if (_contextMenuFlyout)
+            {
+                _contextMenuFlyout.Hide();
+            }
+            TabViewItem().ContextFlyout(nullptr);
+        }
+        else
+        {
+            TabViewItem().ContextFlyout(_contextMenuFlyout);
+        }
     }
 
     // Method Description:
@@ -2092,16 +2197,16 @@ namespace winrt::TerminalApp::implementation
         const auto numOfTabs = TabViewNumTabs();
 
         // enabled if there are other tabs
-        _closeOtherTabsMenuItem.IsEnabled(numOfTabs > 1);
+        _closeOtherTabsMenuItem.IsEnabled(!_tabListPositionOperationsRestricted && numOfTabs > 1);
 
         // enabled if there are other tabs on the right
-        _closeTabsAfterMenuItem.IsEnabled(tabIndex < numOfTabs - 1);
+        _closeTabsAfterMenuItem.IsEnabled(!_tabListPositionOperationsRestricted && tabIndex < numOfTabs - 1);
 
         // enabled if not left-most tab
-        _moveLeftMenuItem.IsEnabled(tabIndex > 0);
+        _moveLeftMenuItem.IsEnabled(!_tabListPositionOperationsRestricted && tabIndex > 0);
 
         // enabled if not last tab
-        _moveRightMenuItem.IsEnabled(tabIndex < numOfTabs - 1);
+        _moveRightMenuItem.IsEnabled(!_tabListPositionOperationsRestricted && tabIndex < numOfTabs - 1);
     }
 
     void Tab::UpdateTabViewIndex(const uint32_t idx, const uint32_t numTabs)
@@ -2540,6 +2645,35 @@ namespace winrt::TerminalApp::implementation
             }
         }
         return nullptr;
+    }
+
+    bool Tab::IsAgentTab() const
+    {
+        if (!_rootPane)
+        {
+            return false;
+        }
+
+        return _rootPane->WalkTree([&](const std::shared_ptr<Pane>& pane) {
+            const auto content = pane->GetContent().try_as<winrt::TerminalApp::AgentPaneContent>();
+            if (!content)
+            {
+                return false;
+            }
+            if (!winrt::get_self<implementation::AgentPaneContent>(content)->AgentSessionId().empty())
+            {
+                return true;
+            }
+
+            for (auto current = pane; current; current = _rootPane->_FindParentOfPane(current))
+            {
+                if (current->IsHidden())
+                {
+                    return false;
+                }
+            }
+            return true;
+        });
     }
 
     // Hide the agent pane without destroying it. The pane stays in the tab
